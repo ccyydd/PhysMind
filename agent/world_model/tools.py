@@ -4739,6 +4739,1192 @@ class PoseCorrectionAdapter(ExternalToolAdapter):
             return None
 
 
+class SimulatableWorldReconstructionAdapter(ExternalToolAdapter):
+    tool_name = "simulatable_world_reconstruction"
+    env_var = ""
+    artifact_name = "simulatable_world_reconstruction.json"
+
+    def run(self, scene: ClevrerScene, question_dir: Path, object_plan: ObjectPlan) -> ToolResult:
+        swr_fit_backend_route = None
+        swr_fit_strategy_route = None
+        swr_fit_geometry_source_route = None
+        swr_visual_pose_preservation_route = None
+        if not self.dry_run:
+            special_scene = (
+                object_plan.special_scene
+                if isinstance(object_plan.special_scene, dict)
+                else {}
+            )
+            scene_metadata = (
+                special_scene.get("scene_metadata")
+                if isinstance(special_scene.get("scene_metadata"), dict)
+                else {}
+            )
+            scenario = str(
+                scene_metadata.get("scenario")
+                or special_scene.get("scenario")
+                or getattr(scene, "scenario", "")
+                or ""
+            ).strip().lower() or None
+            policy_benchmark = _route_policy_benchmark_for_scene(scene)
+            swr_fit_backend_route = _require_swr_fit_backend_route(
+                policy_benchmark=policy_benchmark,
+                scenario=scenario,
+                object_plan=object_plan,
+            )
+            swr_fit_strategy_route = _require_swr_fit_strategy_route(
+                policy_benchmark=policy_benchmark,
+                scenario=scenario,
+                object_plan=object_plan,
+            )
+            swr_fit_geometry_source_route = (
+                _require_swr_fit_geometry_source_route(
+                    policy_benchmark=policy_benchmark,
+                    scenario=scenario,
+                    object_plan=object_plan,
+                )
+            )
+            swr_visual_pose_preservation_route = (
+                _require_swr_visual_pose_preservation_route(
+                    policy_benchmark=policy_benchmark,
+                    scenario=scenario,
+                    object_plan=object_plan,
+                )
+            )
+        artifact_path = self.artifacts.artifact_path(question_dir, self.tool_name, self.artifact_name)
+        existing = self._load_existing(artifact_path)
+        if existing:
+            if swr_fit_backend_route is not None:
+                expected_backend = str(swr_fit_backend_route["route"])
+                existing_fit = existing.payload.get("world_reconstruction_fit")
+                existing_manifest = existing.payload.get(
+                    "world_reconstruction_fit_manifest"
+                )
+                observed_backends = []
+                if isinstance(existing_fit, dict) and existing_fit.get("backend"):
+                    observed_backends.append(str(existing_fit["backend"]))
+                if isinstance(existing_manifest, dict):
+                    rollout = existing_manifest.get("rollout")
+                    if isinstance(rollout, dict) and rollout.get("backend"):
+                        observed_backends.append(str(rollout["backend"]))
+                if any(value != expected_backend for value in observed_backends):
+                    raise ValueError(
+                        "cached SWR backend conflicts with the resolved route: "
+                        f"observed={observed_backends!r} expected={expected_backend!r}"
+                    )
+                _record_swr_fit_backend_result(
+                    existing.payload,
+                    swr_fit_backend_route,
+                )
+                if swr_fit_strategy_route is not None:
+                    strategy_resolution = self._validate_fit_strategy_result(
+                        existing.payload,
+                        backend=expected_backend,
+                        swr_fit_strategy_route=swr_fit_strategy_route,
+                    )
+                    _record_swr_fit_strategy_result(
+                        existing.payload,
+                        swr_fit_strategy_route,
+                    )
+                    existing.payload["fit_strategy_resolution"] = (
+                        strategy_resolution
+                    )
+                if swr_fit_geometry_source_route is not None:
+                    existing_manifest_route = (
+                        existing_manifest.get("swr_fit_geometry_source_route")
+                        if isinstance(existing_manifest, dict)
+                        else None
+                    )
+                    if not isinstance(existing_manifest_route, dict):
+                        raise ValueError(
+                            "cached Physion++ SWR manifest is missing its "
+                            "SWR fit-geometry-source route; rerun SWR instead "
+                            "of relabeling the cached result"
+                        )
+                    _record_swr_fit_geometry_source_result(
+                        {},
+                        existing_manifest_route,
+                    )
+                    if (
+                        existing_manifest_route.get("route")
+                        != swr_fit_geometry_source_route.get("route")
+                    ):
+                        raise ValueError(
+                            "cached SWR geometry source conflicts with the "
+                            "resolved route"
+                        )
+                    _record_swr_fit_geometry_source_result(
+                        existing.payload,
+                        swr_fit_geometry_source_route,
+                    )
+                if swr_visual_pose_preservation_route is not None:
+                    existing_visual_route = existing.payload.get(
+                        "swr_visual_pose_preservation_route"
+                    )
+                    if not isinstance(existing_visual_route, dict):
+                        raise ValueError(
+                            "cached collision SWR artifact is missing its "
+                            "visual-pose-preservation route; rerun SWR instead "
+                            "of relabeling the cached result"
+                        )
+                    if existing_visual_route != swr_visual_pose_preservation_route:
+                        raise ValueError(
+                            "cached SWR visual-pose-preservation route mismatch"
+                        )
+                self.artifacts.write(artifact_path, existing.payload)
+            return existing
+        if self.dry_run:
+            return self._write_placeholder(
+                artifact_path,
+                {
+                    **self.placeholder_payload(scene=scene, object_plan=object_plan),
+                    "question_id": object_plan.question_id,
+                    "simulatable_world_reconstruction_stage": "world_reconstruction_fit_manifest",
+                    "pose_correction_artifact": None,
+                    "trajectory_correction": None,
+                    "target_trajectories": None,
+                    "world_reconstruction_fit_manifest": None,
+                },
+                status="dry_run",
+            )
+
+        pose_correction_path = self.artifacts.artifact_path_by_name(question_dir, "pose_correction.json")
+        pose_correction = self.artifacts.read_optional(pose_correction_path)
+        if not pose_correction:
+            return ToolResult(
+                tool_name=self.tool_name,
+                status="tool_error",
+                artifact_path=str(artifact_path),
+                message=f"missing required pose correction artifact: {pose_correction_path}",
+            )
+
+        trajectory_correction = pose_correction.get("trajectory_correction")
+        corrected_trajectories = (
+            trajectory_correction.get("corrected_trajectories")
+            if isinstance(trajectory_correction, dict)
+            else None
+        )
+        video_metric_depth = self.artifacts.read_optional(
+            self.artifacts.artifact_path_by_name(question_dir, "video_metric_depth.json")
+        )
+        video_metadata = video_metric_depth.get("video_metadata") if isinstance(video_metric_depth, dict) else {}
+        if not isinstance(video_metadata, dict):
+            video_metadata = {}
+        target_trajectories = self._target_trajectories(
+            corrected_trajectories=corrected_trajectories,
+            object_plan=object_plan,
+            pose_correction=pose_correction,
+            question_dir=question_dir,
+            swr_fit_geometry_source_route=swr_fit_geometry_source_route,
+        )
+        world_reconstruction_fit_manifest = self._physics_alignment_manifest(
+            scene=scene,
+            object_plan=object_plan,
+            video_metadata=video_metadata,
+            pose_correction_path=pose_correction_path,
+            target_trajectories=target_trajectories,
+            pose_correction=pose_correction,
+            swr_fit_backend_route=swr_fit_backend_route,
+            swr_fit_strategy_route=swr_fit_strategy_route,
+            swr_fit_geometry_source_route=swr_fit_geometry_source_route,
+            swr_visual_pose_preservation_route=(
+                swr_visual_pose_preservation_route
+            ),
+        )
+        payload = {
+            **self.placeholder_payload(scene=scene, object_plan=object_plan),
+            "question_id": object_plan.question_id,
+            "simulatable_world_reconstruction_stage": "world_reconstruction_fit_manifest",
+            "source_artifact": str(pose_correction_path),
+            "gravity_direction_camera": pose_correction.get("gravity_direction_camera"),
+            "gravity_direction_coordinate_frame": pose_correction.get("gravity_direction_coordinate_frame"),
+            "rotation_correction": pose_correction.get("rotation_correction"),
+            "support_plane_position_correction": pose_correction.get("support_plane_position_correction"),
+            "trajectory_correction": trajectory_correction,
+            "corrected_trajectories": corrected_trajectories,
+            "target_trajectories": target_trajectories,
+            "world_reconstruction_fit_manifest": world_reconstruction_fit_manifest,
+            "active_interval_simulation_state": self._active_interval_state(corrected_trajectories),
+        }
+        if swr_fit_backend_route is not None:
+            _record_swr_fit_backend_result(payload, swr_fit_backend_route)
+        if swr_fit_strategy_route is not None:
+            _record_swr_fit_strategy_result(payload, swr_fit_strategy_route)
+        if swr_fit_geometry_source_route is not None:
+            _record_swr_fit_geometry_source_result(
+                payload,
+                swr_fit_geometry_source_route,
+            )
+        if swr_visual_pose_preservation_route is not None:
+            _record_swr_visual_pose_preservation_result(
+                payload,
+                swr_visual_pose_preservation_route,
+            )
+        physics_result = self._run_physics_alignment(
+            question_dir=question_dir,
+            physics_alignment_manifest=world_reconstruction_fit_manifest,
+            swr_fit_backend_route=swr_fit_backend_route,
+            swr_fit_strategy_route=swr_fit_strategy_route,
+            swr_fit_geometry_source_route=swr_fit_geometry_source_route,
+            swr_visual_pose_preservation_route=(
+                swr_visual_pose_preservation_route
+            ),
+        )
+        payload["physics_rollout"] = physics_result.get("physics_rollout")
+        payload["alignment_optimization"] = physics_result.get("alignment_optimization")
+        payload["fit_error"] = physics_result.get("fit_error")
+        payload["world_reconstruction_fit"] = {
+            "status": physics_result.get("status"),
+            "artifact": physics_result.get("artifact"),
+            "message": physics_result.get("message"),
+            "backend": physics_result.get("backend"),
+        }
+        if swr_fit_backend_route is not None:
+            payload["world_reconstruction_fit"]["resolved_route"] = deepcopy(
+                swr_fit_backend_route
+            )
+        if swr_fit_strategy_route is not None:
+            fit_strategy_resolution = physics_result.get(
+                "fit_strategy_resolution"
+            )
+            payload["fit_strategy_resolution"] = fit_strategy_resolution
+            payload["world_reconstruction_fit"]["strategy"] = (
+                (fit_strategy_resolution or {}).get("effective_strategy")
+            )
+            payload["world_reconstruction_fit"]["resolved_strategy_route"] = (
+                deepcopy(swr_fit_strategy_route)
+            )
+        if swr_fit_geometry_source_route is not None:
+            payload["world_reconstruction_fit"]["resolved_geometry_source_route"] = (
+                deepcopy(swr_fit_geometry_source_route)
+            )
+        if swr_visual_pose_preservation_route is not None:
+            payload["world_reconstruction_fit"][
+                "resolved_visual_pose_preservation_route"
+            ] = deepcopy(swr_visual_pose_preservation_route)
+        self.artifacts.write(artifact_path, payload)
+        return ToolResult(
+            tool_name=self.tool_name,
+            status="ok" if physics_result.get("status") in {"ok", "tool_not_configured"} else "tool_error",
+            artifact_path=str(artifact_path),
+            message=physics_result.get("message"),
+            payload=payload,
+        )
+
+    def _active_interval_state(self, corrected_trajectories: Any) -> Dict[str, Any]:
+        if not isinstance(corrected_trajectories, dict):
+            return {
+                "applied": False,
+                "reason": "missing corrected trajectories",
+                "objects": [],
+            }
+        objects = []
+        for item in corrected_trajectories.get("objects", []):
+            if not isinstance(item, dict):
+                continue
+            objects.append(
+                {
+                    "object_id": item.get("object_id"),
+                    "activation": item.get("activation"),
+                    "inactive_policy": "absent",
+                    "appearance_policy": "appear_at_first_active_frame_disappear_after_last_active_frame",
+                }
+            )
+        return {
+            "applied": bool(objects),
+            "source": "pose_correction.trajectory_correction.corrected_trajectories",
+            "objects": objects,
+        }
+
+    def _target_trajectories(
+        self,
+        *,
+        corrected_trajectories: Any,
+        object_plan: ObjectPlan,
+        pose_correction: Dict[str, Any],
+        question_dir: Path,
+        swr_fit_geometry_source_route: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if swr_fit_geometry_source_route is not None:
+            _record_swr_fit_geometry_source_result(
+                {},
+                swr_fit_geometry_source_route,
+            )
+        if not isinstance(corrected_trajectories, dict) or corrected_trajectories.get("applied") is not True:
+            return {
+                "applied": False,
+                "reason": "missing corrected trajectories",
+                "source": "pose_correction.trajectory_correction.corrected_trajectories",
+                "objects": [],
+            }
+        target_by_id = {str(item.object_id): item for item in object_plan.target_objects}
+        mesh_by_id = self._support_mesh_by_object_id(pose_correction)
+        local_axes_by_id = self._foundationpose_local_axes_payload_by_object(question_dir)
+        objects = []
+        for item in corrected_trajectories.get("objects", []):
+            if not isinstance(item, dict) or item.get("status") not in {None, "ok", "partial"}:
+                continue
+            object_id = str(item.get("object_id") or "")
+            if not object_id:
+                continue
+            target = target_by_id.get(object_id)
+            poses = []
+            for pose in item.get("poses", []):
+                if not isinstance(pose, dict):
+                    continue
+                matrix = pose.get("corrected_pose_4x4")
+                if matrix is None:
+                    continue
+                try:
+                    arr = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(arr).all() or pose.get("frame_index") is None:
+                    continue
+                poses.append(
+                    {
+                        "frame_index": int(pose["frame_index"]),
+                        "corrected_pose_4x4": arr.tolist(),
+                        "position_camera": arr[:3, 3].astype(float).tolist(),
+                    }
+                )
+            poses.sort(key=lambda record: int(record["frame_index"]))
+            mesh_path = mesh_by_id.get(object_id)
+            if not mesh_path:
+                raise ValueError(
+                    "missing pose-correction final effective mesh_path for "
+                    f"SWR target object {object_id}"
+                )
+            mesh_file = Path(mesh_path)
+            if not mesh_file.is_file():
+                raise ValueError(
+                    "pose-correction final effective mesh does not exist for "
+                    f"SWR target object {object_id}: {mesh_file}"
+                )
+            try:
+                dimensions = self._mesh_dimensions(mesh_file)
+            except Exception as exc:
+                raise ValueError(
+                    "failed to read pose-correction final effective mesh for "
+                    f"SWR target object {object_id}: {mesh_file}"
+                ) from exc
+            effective_geometry = str(
+                item.get("effective_geometry_type")
+                or (target.geometry_type if target else "unknown")
+            )
+            source_geometry = str(
+                item.get("source_geometry_type")
+                or (target.geometry_type if target else "unknown")
+            )
+            target_record = {
+                "object_id": object_id,
+                "status": "ok" if poses else "missing_poses",
+                "description": target.description if target else "",
+                "geometry_type": effective_geometry,
+                "source_geometry_type": source_geometry,
+                "appearance": target.appearance if target else {},
+                "mesh_path": mesh_path,
+                "dimensions": dimensions,
+                "dimensions_source": "mesh_aabb_extent",
+                "foundationpose_local_axes": local_axes_by_id.get(object_id),
+                "activation": item.get("activation") if isinstance(item.get("activation"), dict) else self._activation_from_poses(poses),
+                "pose_count": len(poses),
+                "poses": poses,
+            }
+            if swr_fit_geometry_source_route is not None:
+                target_record["mesh_source"] = SWR_FIT_GEOMETRY_SOURCE_ROUTE
+            objects.append(target_record)
+        payload = {
+            "applied": bool(objects),
+            "source": corrected_trajectories.get("source") or "pose_correction.trajectory_correction.corrected_trajectories",
+            "pose_field": "corrected_pose_4x4",
+            "translation_field": "position_camera",
+            "objects": objects,
+        }
+        if swr_fit_geometry_source_route is not None:
+            payload["fit_geometry_source"] = SWR_FIT_GEOMETRY_SOURCE_ROUTE
+            payload["swr_fit_geometry_source_route"] = deepcopy(
+                swr_fit_geometry_source_route
+            )
+        return payload
+
+    def _support_mesh_by_object_id(self, pose_correction: Dict[str, Any]) -> Dict[str, str]:
+        support = pose_correction.get("support_plane_position_correction")
+        if not isinstance(support, dict):
+            return {}
+        mesh_by_id = {}
+        for item in support.get("objects", []):
+            if not isinstance(item, dict):
+                continue
+            object_id = str(item.get("object_id") or "")
+            mesh_path = item.get("mesh_path")
+            if object_id and mesh_path:
+                mesh_by_id[object_id] = str(mesh_path)
+        return mesh_by_id
+
+    def _mesh_dimensions(self, mesh_path: Path) -> List[float]:
+        vertices = _load_mesh_vertices(mesh_path)
+        min_corner = np.min(vertices, axis=0)
+        max_corner = np.max(vertices, axis=0)
+        dimensions = max_corner - min_corner
+        if dimensions.shape != (3,) or not np.isfinite(dimensions).all():
+            raise ValueError(f"invalid mesh dimensions: {mesh_path}")
+        return [max(float(value), 0.02) for value in dimensions.tolist()]
+
+    def _foundationpose_local_axes_payload_by_object(self, question_dir: Path) -> Dict[str, Dict[str, Any]]:
+        mesh_conditioning = self.artifacts.read_optional(
+            self.artifacts.artifact_path_by_name(question_dir, "mesh_conditioning.json")
+        )
+        if not isinstance(mesh_conditioning, dict):
+            return {}
+        axes_by_id = {}
+        for item in mesh_conditioning.get("objects", []):
+            if not isinstance(item, dict) or item.get("status") != "ok":
+                continue
+            object_id = str(item.get("object_id") or "")
+            axes = item.get("foundationpose_local_axes")
+            if object_id and isinstance(axes, dict):
+                axes_by_id[object_id] = axes
+        return axes_by_id
+
+    def _physics_alignment_fit_strategy(
+        self,
+        *,
+        backend: str,
+        swr_fit_strategy_route: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        expected_strategy = SWR_FIT_STRATEGY_BY_BACKEND.get(backend)
+        if expected_strategy is None:
+            if swr_fit_strategy_route is not None:
+                raise ValueError(
+                    "SWR fit-strategy route is not applicable to backend "
+                    f"{backend!r}"
+                )
+            return None
+        if swr_fit_strategy_route is None:
+            raise ValueError(
+                f"missing SWR fit-strategy route for backend {backend!r}"
+            )
+        if (
+            swr_fit_strategy_route.get("decision_id")
+            != SWR_FIT_STRATEGY_DECISION_ID
+        ):
+            raise ValueError(
+                "SWR fit-strategy route has an unexpected decision_id: "
+                f"{swr_fit_strategy_route.get('decision_id')!r}"
+            )
+        strategy = str(swr_fit_strategy_route.get("route") or "")
+        if strategy not in SWR_FIT_STRATEGY_ROUTES:
+            raise ValueError(f"unsupported SWR fit strategy route: {strategy!r}")
+        if strategy != expected_strategy:
+            raise ValueError(
+                "SWR fit strategy does not match the selected backend: "
+                f"{strategy!r} != {expected_strategy!r} for {backend!r}"
+            )
+        return strategy
+
+    def _observed_fit_strategy(
+        self,
+        result: Dict[str, Any],
+        *,
+        backend: str,
+    ) -> tuple[Optional[str], list[str]]:
+        resolution = result.get("fit_strategy_resolution")
+        if isinstance(resolution, dict):
+            effective = str(resolution.get("effective_strategy") or "") or None
+            internal = resolution.get("backend_internal_strategies")
+            internal_strategies = (
+                [str(value) for value in internal]
+                if isinstance(internal, list)
+                else []
+            )
+            if effective is not None:
+                return effective, internal_strategies
+
+        fit_summary = result.get("world_reconstruction_fit")
+        if isinstance(fit_summary, dict) and fit_summary.get("strategy"):
+            return str(fit_summary["strategy"]), []
+
+        strategy_container = (
+            result.get("joint_alignment_optimization")
+            if backend == "swr_backend.wall_bounce_sphere"
+            else result.get("alignment_optimization")
+        )
+        observed = (
+            str(strategy_container.get("strategy"))
+            if isinstance(strategy_container, dict)
+            and strategy_container.get("strategy")
+            else None
+        )
+        internal_strategies = []
+        if backend == "swr_backend.wall_bounce_sphere":
+            segments = result.get("segments")
+            if isinstance(segments, list):
+                for segment in segments:
+                    alignment = (
+                        segment.get("alignment_optimization")
+                        if isinstance(segment, dict)
+                        else None
+                    )
+                    if isinstance(alignment, dict) and alignment.get("strategy"):
+                        internal_strategies.append(str(alignment["strategy"]))
+        return observed, internal_strategies
+
+    def _validate_fit_strategy_result(
+        self,
+        result: Dict[str, Any],
+        *,
+        backend: str,
+        swr_fit_strategy_route: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        requested = self._physics_alignment_fit_strategy(
+            backend=backend,
+            swr_fit_strategy_route=swr_fit_strategy_route,
+        )
+        if requested is None:
+            return None
+        observed, internal_strategies = self._observed_fit_strategy(
+            result,
+            backend=backend,
+        )
+        fallback_applied = (
+            backend == "swr_backend.surface_friction_sphere"
+            and observed == FRICTION_PLATFORM_SINGLE_PLANE_FALLBACK_STRATEGY
+        )
+        if observed != requested and not fallback_applied:
+            raise ValueError(
+                "world reconstruction fit strategy conflicts with the resolved "
+                f"route: {observed!r} != {requested!r}"
+            )
+        if backend == "swr_backend.wall_bounce_sphere":
+            if internal_strategies != [
+                BOUNCY_WALL_INTERNAL_FIT_STRATEGY,
+                BOUNCY_WALL_INTERNAL_FIT_STRATEGY,
+            ]:
+                raise ValueError(
+                    "bouncy-wall backend-internal fit strategy contract mismatch: "
+                    f"{internal_strategies!r}"
+                )
+        return {
+            "requested_strategy": requested,
+            "effective_strategy": observed,
+            "fallback_applied": fallback_applied,
+            "fallback_kind": (
+                "runtime_optimization_failure_fallback"
+                if fallback_applied
+                else None
+            ),
+            "backend_internal_strategies": internal_strategies,
+        }
+
+    def _physics_alignment_manifest(
+        self,
+        *,
+        scene: ClevrerScene,
+        object_plan: ObjectPlan,
+        video_metadata: Dict[str, Any],
+        pose_correction_path: Path,
+        target_trajectories: Dict[str, Any],
+        pose_correction: Dict[str, Any],
+        swr_fit_backend_route: Optional[Dict[str, Any]],
+        swr_fit_strategy_route: Optional[Dict[str, Any]],
+        swr_fit_geometry_source_route: Optional[Dict[str, Any]],
+        swr_visual_pose_preservation_route: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        backend = self._physics_alignment_backend(swr_fit_backend_route)
+        self._physics_alignment_fit_strategy(
+            backend=backend,
+            swr_fit_strategy_route=swr_fit_strategy_route,
+        )
+        if backend in PHYSION_PP_SWR_FIT_BACKEND_ROUTES:
+            if swr_fit_geometry_source_route is None:
+                raise ValueError(
+                    "missing SWR fit-geometry-source route for Physion++ backend "
+                    f"{backend!r}"
+                )
+            _record_swr_fit_geometry_source_result(
+                {},
+                swr_fit_geometry_source_route,
+            )
+        elif swr_fit_geometry_source_route is not None:
+            raise ValueError(
+                "SWR fit-geometry-source route is not applicable to backend "
+                f"{backend!r}"
+            )
+        if backend in {
+            "swr_backend.collision_friction_spheres",
+            "swr_backend.collision_mass_spheres",
+        }:
+            if swr_visual_pose_preservation_route is None:
+                raise ValueError(
+                    "missing SWR visual-pose-preservation route for collision "
+                    f"backend {backend!r}"
+                )
+            _record_swr_visual_pose_preservation_result(
+                {},
+                swr_visual_pose_preservation_route,
+            )
+        elif swr_visual_pose_preservation_route is not None:
+            raise ValueError(
+                "SWR visual-pose-preservation route is not applicable to "
+                f"backend {backend!r}"
+            )
+        manifest = {
+            "stage": "simulatable_world_reconstruction",
+            "mode": "trajectory_informed_physics_alignment",
+            "scene_index": scene.scene_index,
+            "video_filename": scene.video_filename,
+            "question_id": object_plan.question_id,
+            "pose_correction_artifact": str(pose_correction_path),
+            "video_metadata": video_metadata,
+            "gravity_direction_camera": pose_correction.get("gravity_direction_camera"),
+            "gravity_direction_coordinate_frame": pose_correction.get("gravity_direction_coordinate_frame"),
+            "gravity_direction_convention": pose_correction.get("gravity_direction_convention"),
+            "object_plan": object_plan.to_dict(),
+            "static_scene_objects": self._static_scene_objects(object_plan),
+            "target_trajectories": target_trajectories,
+            "support_plane_position_correction": pose_correction.get("support_plane_position_correction"),
+            "activation_policy": {
+                "state_model": "active_interval_absent_outside",
+                "inactive_policy": "absent",
+                "appearance_policy": "appear_at_first_active_frame_disappear_after_last_active_frame",
+            },
+            "rollout": {
+                "backend": backend,
+                "target_pose_field": "corrected_pose_4x4",
+                "target_translation_field": "position_camera",
+                "rotation_loss": "disabled",
+            },
+        }
+        if swr_fit_backend_route is not None:
+            manifest["swr_fit_backend_route"] = deepcopy(swr_fit_backend_route)
+        if swr_fit_strategy_route is not None:
+            manifest["swr_fit_strategy_route"] = deepcopy(
+                swr_fit_strategy_route
+            )
+        if swr_fit_geometry_source_route is not None:
+            manifest["swr_fit_geometry_source_route"] = deepcopy(
+                swr_fit_geometry_source_route
+            )
+        if swr_visual_pose_preservation_route is not None:
+            manifest["swr_visual_pose_preservation_route"] = deepcopy(
+                swr_visual_pose_preservation_route
+            )
+        return manifest
+
+    def _physics_alignment_backend(
+        self,
+        swr_fit_backend_route: Optional[Dict[str, Any]],
+    ) -> str:
+        if swr_fit_backend_route is None:
+            return "swr_backend.impulse_analytic"
+        if (
+            swr_fit_backend_route.get("decision_id")
+            != SWR_FIT_BACKEND_DECISION_ID
+        ):
+            raise ValueError(
+                "SWR fit-backend route has an unexpected decision_id: "
+                f"{swr_fit_backend_route.get('decision_id')!r}"
+            )
+        backend = str(swr_fit_backend_route.get("route") or "")
+        if backend not in SWR_FIT_BACKEND_ROUTES:
+            raise ValueError(f"unsupported SWR fit backend route: {backend!r}")
+        return backend
+
+    def _corrected_rotation_maps_blender_world(
+        self,
+        physics_alignment_manifest: Dict[str, Any],
+    ) -> Dict[str, Dict[int, np.ndarray]]:
+        target = physics_alignment_manifest.get("target_trajectories")
+        objects = target.get("objects") if isinstance(target, dict) else None
+        if not isinstance(objects, list):
+            raise ValueError(
+                "SWR visual pose preservation requires formal "
+                "target_trajectories.objects"
+            )
+        opencv_to_blender = np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        pose_maps: Dict[str, Dict[int, np.ndarray]] = {}
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+            object_id = str(item.get("object_id") or "").strip()
+            if not object_id:
+                continue
+            frame_map: Dict[int, np.ndarray] = {}
+            for pose in item.get("poses") or []:
+                if not isinstance(pose, dict):
+                    continue
+                frame_index = pose.get("frame_index")
+                pose_camera = pose.get("corrected_pose_4x4")
+                if frame_index is None or pose_camera is None:
+                    continue
+                try:
+                    camera_matrix = np.asarray(
+                        pose_camera,
+                        dtype=np.float64,
+                    ).reshape(4, 4)
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(camera_matrix).all():
+                    continue
+                frame_map[int(frame_index)] = (
+                    opencv_to_blender @ camera_matrix
+                )[:3, :3]
+            if frame_map:
+                pose_maps[object_id] = frame_map
+        if not pose_maps:
+            raise ValueError(
+                "SWR visual pose preservation found no corrected rotations"
+            )
+        return pose_maps
+
+    def _decorate_swr_visual_pose_records(
+        self,
+        *,
+        records_by_object: Any,
+        pose_maps: Dict[str, Dict[int, np.ndarray]],
+        attachment_counts: Dict[str, int],
+    ) -> int:
+        if not isinstance(records_by_object, dict):
+            return 0
+        decorated_count = 0
+        for raw_object_id, records in records_by_object.items():
+            object_id = str(raw_object_id)
+            if not isinstance(records, list) or not records:
+                continue
+            frame_map = pose_maps.get(object_id)
+            if not frame_map:
+                raise ValueError(
+                    "SWR visual pose preservation is missing corrected "
+                    f"rotations for object {object_id}"
+                )
+            first_frame = min(frame_map)
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    frame_index = int(record["frame_index"])
+                    position = np.asarray(
+                        record["position_blender_world_m"],
+                        dtype=np.float64,
+                    ).reshape(3)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "SWR visual pose preservation found an invalid fitted "
+                        f"record for object {object_id}"
+                    ) from exc
+                if frame_index in frame_map:
+                    rotation = frame_map[frame_index]
+                    policy = "exact_corrected_rotation"
+                else:
+                    earlier = [
+                        value for value in frame_map if value <= frame_index
+                    ]
+                    if earlier:
+                        rotation = frame_map[max(earlier)]
+                        policy = "held_last_corrected_rotation"
+                    else:
+                        rotation = frame_map[first_frame]
+                        policy = "held_first_corrected_rotation"
+                visual_pose = np.eye(4, dtype=np.float64)
+                visual_pose[:3, :3] = rotation
+                visual_pose[:3, 3] = position
+                record["rotation_blender_world_3x3"] = (
+                    rotation.astype(float).tolist()
+                )
+                record["pose_blender_world_4x4"] = (
+                    visual_pose.astype(float).tolist()
+                )
+                record["visual_pose_only"] = True
+                record["visual_rotation_policy"] = policy
+                attachment_counts[policy] = (
+                    attachment_counts.get(policy, 0) + 1
+                )
+                decorated_count += 1
+        return decorated_count
+
+    def _apply_swr_visual_pose_preservation(
+        self,
+        *,
+        result: Dict[str, Any],
+        physics_alignment_manifest: Dict[str, Any],
+        route_record: Dict[str, Any],
+    ) -> None:
+        _record_swr_visual_pose_preservation_result({}, route_record)
+        route = str(route_record["route"])
+        if route == "visual_pose.position_only":
+            result["visual_pose_preservation"] = {
+                "enabled": False,
+                "position_source": "SWR fitted trajectory",
+                "rotation_source": None,
+                "affects_physics": False,
+                "affects_contact_answer": False,
+                "attached_fit_record_count": 0,
+                "attachment_counts": {},
+            }
+            return
+        pose_maps = self._corrected_rotation_maps_blender_world(
+            physics_alignment_manifest
+        )
+        attachment_counts: Dict[str, int] = {}
+        decorated_count = 0
+        segments = result.get("segments")
+        if not isinstance(segments, list):
+            raise ValueError(
+                "SWR visual pose preservation requires collision fit segments"
+            )
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            decorated_count += self._decorate_swr_visual_pose_records(
+                records_by_object=segment.get("target_trajectories"),
+                pose_maps=pose_maps,
+                attachment_counts=attachment_counts,
+            )
+            physics_rollout = segment.get("physics_rollout")
+            decorated_count += self._decorate_swr_visual_pose_records(
+                records_by_object=(
+                    physics_rollout.get("simulated_trajectories")
+                    if isinstance(physics_rollout, dict)
+                    else None
+                ),
+                pose_maps=pose_maps,
+                attachment_counts=attachment_counts,
+            )
+        if decorated_count == 0:
+            raise ValueError(
+                "SWR visual pose preservation found no fitted records to decorate"
+            )
+        result["visual_pose_preservation"] = {
+            "enabled": True,
+            "position_source": "SWR fitted trajectory",
+            "rotation_source": "pose_correction corrected_pose_4x4",
+            "missing_frame_policy": (
+                "exact else hold last corrected rotation, or first before onset"
+            ),
+            "affects_physics": False,
+            "affects_contact_answer": False,
+            "attached_fit_record_count": decorated_count,
+            "attachment_counts": attachment_counts,
+        }
+
+    def _run_physics_alignment(
+        self,
+        *,
+        question_dir: Path,
+        physics_alignment_manifest: Dict[str, Any],
+        swr_fit_backend_route: Optional[Dict[str, Any]],
+        swr_fit_strategy_route: Optional[Dict[str, Any]],
+        swr_fit_geometry_source_route: Optional[Dict[str, Any]],
+        swr_visual_pose_preservation_route: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        try:
+            backend = self._physics_alignment_backend(swr_fit_backend_route)
+            requested_strategy = self._physics_alignment_fit_strategy(
+                backend=backend,
+                swr_fit_strategy_route=swr_fit_strategy_route,
+            )
+        except ValueError as exc:
+            return {
+                "status": "tool_error",
+                "artifact": str(self.artifacts.artifact_path(question_dir, self.tool_name, "world_reconstruction_fit.json")),
+                "message": str(exc),
+                "backend": None,
+            }
+        if backend == "swr_backend.surface_friction_sphere":
+            command = os.getenv("PHYSMIND_PHYSIONPP_FRICTION_SPHERE_SYSID_CMD") or DEFAULT_PHYSIONPP_FRICTION_SPHERE_SYSID_CMD
+            script_name = "run_physionpp_friction_sphere_sysid.py"
+            missing_message = "PHYSMIND_PHYSIONPP_FRICTION_SPHERE_SYSID_CMD is not set"
+        elif backend == "swr_backend.wall_bounce_sphere":
+            command = (
+                os.getenv("PHYSMIND_PHYSIONPP_BOUNCY_WALL_SPHERE_SYSID_CMD")
+                or DEFAULT_PHYSIONPP_BOUNCY_WALL_SPHERE_SYSID_CMD
+            )
+            script_name = "run_physionpp_bouncy_wall_sphere_sysid.py"
+            missing_message = "PHYSMIND_PHYSIONPP_BOUNCY_WALL_SPHERE_SYSID_CMD is not set"
+        elif backend == "swr_backend.platform_bounce_sphere":
+            command = (
+                os.getenv("PHYSMIND_PHYSIONPP_BOUNCY_PLATFORM_SPHERE_SYSID_CMD")
+                or DEFAULT_PHYSIONPP_BOUNCY_PLATFORM_SPHERE_SYSID_CMD
+            )
+            script_name = "run_physionpp_bouncy_platform_sphere_sysid.py"
+            missing_message = "PHYSMIND_PHYSIONPP_BOUNCY_PLATFORM_SPHERE_SYSID_CMD is not set"
+        elif backend == "swr_backend.collision_friction_spheres":
+            command = (
+                os.getenv("PHYSMIND_PHYSIONPP_FRICTION_COLLISION_SPHERE_SYSID_CMD")
+                or DEFAULT_PHYSIONPP_FRICTION_COLLISION_SPHERE_SYSID_CMD
+            )
+            script_name = "run_physionpp_friction_collision_sphere_sysid.py"
+            missing_message = "PHYSMIND_PHYSIONPP_FRICTION_COLLISION_SPHERE_SYSID_CMD is not set"
+        elif backend == "swr_backend.collision_mass_spheres":
+            command = (
+                os.getenv("PHYSMIND_PHYSIONPP_MASS_COLLISION_SPHERE_SYSID_CMD")
+                or DEFAULT_PHYSIONPP_MASS_COLLISION_SPHERE_SYSID_CMD
+            )
+            script_name = "run_physionpp_mass_collision_sphere_sysid.py"
+            missing_message = "PHYSMIND_PHYSIONPP_MASS_COLLISION_SPHERE_SYSID_CMD is not set"
+        else:
+            command = os.getenv("PHYSMIND_IMPULSE_ANALYTIC_SYSID_CMD") or DEFAULT_IMPULSE_ANALYTIC_SYSID_CMD
+            script_name = "run_impulse_analytic_sysid.py"
+            missing_message = "PHYSMIND_IMPULSE_ANALYTIC_SYSID_CMD is not set"
+        result_path = self.artifacts.artifact_path(question_dir, self.tool_name, "world_reconstruction_fit.json")
+        manifest_path = self.artifacts.artifact_path(question_dir, self.tool_name, "world_reconstruction_fit_manifest.json")
+        physics_alignment_manifest = json.loads(json.dumps(physics_alignment_manifest))
+        rollout = physics_alignment_manifest.setdefault("rollout", {})
+        if isinstance(rollout, dict):
+            rollout["backend"] = backend
+        self.artifacts.write(manifest_path, physics_alignment_manifest)
+        if not command:
+            return {
+                "status": "tool_not_configured",
+                "artifact": str(result_path),
+                "message": missing_message,
+                "backend": backend,
+            }
+        script_path = Path(__file__).resolve().parents[2] / "scripts" / "world_model" / script_name
+        if backend in {
+            "swr_backend.wall_bounce_sphere",
+            "swr_backend.platform_bounce_sphere",
+            "swr_backend.collision_friction_spheres",
+            "swr_backend.collision_mass_spheres",
+        }:
+            args = self._physionpp_world_modeling_alignment_command(
+                command=command,
+                script_path=script_path,
+                world_modeling_dir=question_dir,
+                result_path=result_path,
+            )
+            if backend in {
+                "swr_backend.collision_friction_spheres",
+                "swr_backend.collision_mass_spheres",
+            } and self.artifacts.debug_artifacts:
+                args.append("--render-video")
+        else:
+            args = self._physics_alignment_command(
+                command,
+                script_path,
+                manifest_path,
+                result_path,
+                render_video=self.artifacts.debug_artifacts,
+            )
+        if (
+            backend == "swr_backend.surface_friction_sphere"
+            and requested_strategy == FRICTION_PLATFORM_BOUNDED_FIT_STRATEGY
+        ):
+            args.extend(["--rollout-mode", "bounded_planes"])
+        start = time.perf_counter()
+        _log_tool(
+            self.tool_name,
+            f"physics_alignment command start backend={backend} command={command} manifest={manifest_path} output={result_path}",
+        )
+        completed = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(result_path.parent),
+            env=_external_tool_env(question_dir, self.artifacts.debug_artifacts),
+        )
+        elapsed = time.perf_counter() - start
+        stdout = _short_text(completed.stdout or "")
+        stderr = _short_text(completed.stderr or "")
+        _log_tool(self.tool_name, f"physics_alignment command end returncode={completed.returncode} elapsed={elapsed:.1f}s")
+        if stdout:
+            _log_tool(self.tool_name, f"physics_alignment stdout {stdout}")
+        if stderr:
+            _log_tool(self.tool_name, f"physics_alignment stderr {stderr}")
+        if completed.returncode != 0:
+            return {
+                "status": "tool_error",
+                "artifact": str(result_path),
+                "message": (completed.stderr or completed.stdout or "").strip(),
+                "backend": backend,
+            }
+        result = self.artifacts.read_optional(result_path)
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return {
+                "status": "tool_error",
+                "artifact": str(result_path),
+                "message": (completed.stderr or completed.stdout or "world reconstruction fit did not produce an ok artifact").strip(),
+                "backend": result.get("backend") if isinstance(result, dict) else None,
+            }
+        if result.get("backend") != backend:
+            return {
+                "status": "tool_error",
+                "artifact": str(result_path),
+                "message": (
+                    "world reconstruction fit backend conflicts with the resolved "
+                    f"route: {result.get('backend')!r} != {backend!r}"
+                ),
+                "backend": result.get("backend"),
+            }
+        if swr_visual_pose_preservation_route is not None:
+            try:
+                self._apply_swr_visual_pose_preservation(
+                    result=result,
+                    physics_alignment_manifest=physics_alignment_manifest,
+                    route_record=swr_visual_pose_preservation_route,
+                )
+            except ValueError as exc:
+                return {
+                    "status": "tool_error",
+                    "artifact": str(result_path),
+                    "message": str(exc),
+                    "backend": result.get("backend"),
+                }
+        try:
+            fit_strategy_resolution = self._validate_fit_strategy_result(
+                result,
+                backend=backend,
+                swr_fit_strategy_route=swr_fit_strategy_route,
+            )
+        except ValueError as exc:
+            return {
+                "status": "tool_error",
+                "artifact": str(result_path),
+                "message": str(exc),
+                "backend": result.get("backend"),
+            }
+        if swr_fit_backend_route is not None:
+            _record_swr_fit_backend_result(result, swr_fit_backend_route)
+        if swr_fit_strategy_route is not None:
+            _record_swr_fit_strategy_result(result, swr_fit_strategy_route)
+        if swr_fit_geometry_source_route is not None:
+            _record_swr_fit_geometry_source_result(
+                result,
+                swr_fit_geometry_source_route,
+            )
+        if swr_visual_pose_preservation_route is not None:
+            _record_swr_visual_pose_preservation_result(
+                result,
+                swr_visual_pose_preservation_route,
+            )
+        if fit_strategy_resolution is not None:
+            result["fit_strategy_resolution"] = fit_strategy_resolution
+        if (
+            swr_fit_backend_route is not None
+            or swr_fit_strategy_route is not None
+            or swr_fit_geometry_source_route is not None
+            or swr_visual_pose_preservation_route is not None
+        ):
+            self.artifacts.write(result_path, result)
+        rollout = result.setdefault("physics_rollout", {})
+        if not isinstance(rollout, dict):
+            result["physics_rollout"] = {}
+            rollout = result["physics_rollout"]
+        if self.artifacts.debug_artifacts:
+            render_command = os.getenv("PHYSMIND_BLENDER_CMD") or DEFAULT_BLENDER_CMD
+            if render_command:
+                self._render_physics_alignment_blender_debug(
+                    question_dir=question_dir,
+                    result_path=result_path,
+                    result=result,
+                    physics_alignment_manifest=physics_alignment_manifest,
+                    command=render_command,
+                )
+            else:
+                rollout["blender_debug_render"] = {
+                    "status": "tool_not_configured",
+                    "message": "PHYSMIND_BLENDER_CMD is not set",
+                }
+                self.artifacts.write(result_path, result)
+        else:
+            rollout = result.setdefault("physics_rollout", {})
+            if isinstance(rollout, dict):
+                rollout["blender_debug_render"] = {
+                    "status": "skipped",
+                    "message": "debug_artifacts is disabled",
+                }
+                self.artifacts.write(result_path, result)
+        return {
+            **result,
+            "status": "ok",
+            "artifact": str(result_path),
+            "message": result.get("message"),
+            "backend": result.get("backend"),
+        }
+
+    def _physics_alignment_command(
+        self,
+        command: str,
+        script_path: Path,
+        manifest_path: Path,
+        result_path: Path,
+        *,
+        render_video: bool,
+    ) -> list[str]:
+        tokens = shlex.split(command)
+        runner_args = [
+            "--manifest",
+            str(manifest_path.resolve()),
+            "--output",
+            str(result_path.resolve()),
+        ]
+        if render_video:
+            runner_args.append("--render-video")
+        script_name = script_path.name
+        module_name = f"scripts.world_model.{script_path.stem}"
+        normalized_tokens = [
+            str(script_path) if Path(token).name == script_name else token
+            for token in tokens
+        ]
+        if any(Path(token).name == script_name or token == module_name for token in normalized_tokens):
+            return normalized_tokens + runner_args
+        return tokens + [str(script_path), *runner_args]
+
+    def _physionpp_world_modeling_alignment_command(
+        self,
+        *,
+        command: str,
+        script_path: Path,
+        world_modeling_dir: Path,
+        result_path: Path,
+    ) -> list[str]:
+        tokens = shlex.split(command)
+        runner_args = [
+            "--world-modeling-dir",
+            str(world_modeling_dir.resolve()),
+            "--output",
+            str(result_path.resolve()),
+            "--output-dir",
+            str(result_path.parent.resolve()),
+        ]
+        script_name = script_path.name
+        module_name = f"scripts.world_model.{script_path.stem}"
+        normalized_tokens = [
+            str(script_path) if Path(token).name == script_name else token
+            for token in tokens
+        ]
+        if any(Path(token).name == script_name or token == module_name for token in normalized_tokens):
+            return normalized_tokens + runner_args
+        return tokens + [str(script_path), *runner_args]
+
+
+
+    def _blender_world_pose_to_opencv_camera_pose(self, pose_blender_world: np.ndarray) -> np.ndarray:
+        opencv_to_blender = np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        return np.linalg.inv(opencv_to_blender) @ pose_blender_world
+
+    def _static_scene_objects(self, object_plan: ObjectPlan) -> list[Dict[str, Any]]:
+        scene_objects = object_plan.scene_objects if isinstance(object_plan.scene_objects, dict) else {}
+        static_objects = scene_objects.get("static_objects")
+        return [item for item in static_objects if isinstance(item, dict)] if isinstance(static_objects, list) else []
 
 class SAM3VideoTracksAdapter(ExternalToolAdapter):
     tool_name = "sam3_video_tracks"
