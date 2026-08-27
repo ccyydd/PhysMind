@@ -616,6 +616,11 @@ def main() -> None:
     debug_video = None
     if args.render_video:
         manifest = _load_json(Path(selected["output_path"]).parent / "physics_alignment_manifest.json")
+        debug_video = friction_swr._render_bounded_plane_camera_debug(
+            manifest=manifest,
+            result=result,
+            output_dir=output_dir,
+        )
     print(
         json.dumps(
             {

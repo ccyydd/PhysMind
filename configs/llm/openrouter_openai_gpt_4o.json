@@ -1,0 +1,6 @@
+{
+  "provider": "openrouter",
+  "model": "openai/gpt-4o",
+  "input_mode": "sampled_frames",
+  "num_frames": 8
+}

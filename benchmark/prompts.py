@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from benchmark.clevrer import ClevrerQuestion
+from benchmark.physion_pp import (
+    PHYSION_PP_BASELINE_CURTAIN_SCENARIOS,
+    PHYSION_PP_BASELINE_NO_CURTAIN_SCENARIOS,
+    PhysionPPQuestion,
+)
 from benchmark.specs import CLEVRER_CHOICE_POLICY
 
 
@@ -48,12 +53,48 @@ Watch the video carefully and determine which choices are correct.
 """
 
 
+PHYSION_PP_NO_CURTAIN_OCP_PROMPT = """You are solving a Physion++ video physical reasoning question.
+Watch the video carefully and predict future object contact.
+
+This is one continuous scene with no curtain or rearrangement. Infer hidden mass, friction, or bounciness from motion, not appearance.
+
+Near the end, the scene freezes for two seconds while cues identify the targets: red is the AGENT and yellow is the PATIENT. The freeze and cues do not advance time, physically stop objects, or reset velocity. Continue from just before the freeze using the preceding motion.
+
+First reason about the physical evidence and future motion. Then output exactly yes or no in <answer> </answer>.
+"""
 
 
+PHYSION_PP_CURTAIN_OCP_PROMPT = """You are solving a Physion++ video physical reasoning question.
+Watch the video carefully and predict future object contact.
+
+Before the curtain, infer hidden mass, friction, or bounciness from motion, not appearance. After the curtain, objects may be rearranged: use the new setup and transfer only those properties, not prior positions or trajectories.
+
+Near the end, the scene freezes for two seconds while cues identify the targets: red is the AGENT and yellow is the PATIENT. The freeze and cues do not advance time, physically stop objects, or reset velocity. Continue from just before the freeze using post-curtain motion.
+
+First reason about the physical evidence and future motion. Then output exactly yes or no in <answer> </answer>.
+"""
 
 
+PHYSION_PP_TRACKING_CUE_NO_CURTAIN_OCP_PROMPT = """You are solving a Physion++ video physical reasoning question.
+Watch the video frames carefully and predict future object contact.
+
+This is one continuous scene with no curtain or rearrangement. Infer hidden mass, friction, or bounciness from motion, not appearance.
+
+Throughout the input, a red overlay continuously identifies the AGENT and a yellow overlay continuously identifies the PATIENT. These tracking overlays are annotations only and do not change either object's appearance, motion, or physical properties. The clip ends immediately before the original stationary blinking-cue interval; no freeze or separate cue frame is included. Continue from the final observed motion.
+
+First reason about the physical evidence and future motion. Then output exactly yes or no in <answer> </answer>.
+"""
 
 
+PHYSION_PP_TRACKING_CUE_CURTAIN_OCP_PROMPT = """You are solving a Physion++ video physical reasoning question.
+Watch the video frames carefully and predict future object contact.
+
+Before the curtain, infer hidden mass, friction, or bounciness from motion, not appearance. After the curtain, objects may be rearranged: use the new setup and transfer only those properties, not prior positions or trajectories.
+
+Throughout the input, a red overlay continuously identifies the AGENT and a yellow overlay continuously identifies the PATIENT. These tracking overlays are annotations only and do not change either object's appearance, motion, or physical properties. The clip ends immediately before the original stationary blinking-cue interval; no freeze or separate cue frame is included. Continue from the final observed post-curtain motion.
+
+First reason about the physical evidence and future motion. Then output exactly yes or no in <answer> </answer>.
+"""
 
 
 

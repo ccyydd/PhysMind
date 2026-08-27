@@ -8,7 +8,13 @@ from agent.direct_answer import (
     run_physion_pp_test_direct_answer,
 )
 from agent.query import infer_model_family
+from agent.world_model.route_policy import load_route_policy
 from benchmark.clevrer import default_clevrer_root
+from benchmark.physion_pp import (
+    PHYSION_PP_BASELINE_SCENARIOS,
+    PROPERTIES as PHYSION_PP_PROPERTIES,
+    default_physion_pp_root,
+)
 from utils.config import build_model_config
 from utils.terminal import terminal_print
 
@@ -196,6 +202,44 @@ def print_metrics_summary(run_dir: str) -> None:
         )
 
     physion_pp_ocp = metrics.get("physion_pp_ocp", {})
+    if physion_pp_ocp.get("total_questions", 0):
+        terminal_print(
+            "[metrics] physion_pp_ocp "
+            f"accuracy={physion_pp_ocp.get('accuracy', 0.0):.4f} "
+            f"correct={physion_pp_ocp.get('correct_questions', 0)}/{physion_pp_ocp.get('total_questions', 0)} "
+            f"valid={physion_pp_ocp.get('valid_answer_count', 0)} "
+            f"invalid={physion_pp_ocp.get('invalid_answer_count', 0)} "
+            f"predicted_yes_rate={physion_pp_ocp.get('predicted_yes_rate', 0.0):.4f}"
+        )
+        by_scenario = physion_pp_ocp.get("by_scenario", {})
+        for scenario in sorted(by_scenario):
+            stats = by_scenario[scenario]
+            terminal_print(
+                f"[metrics] physion_pp_ocp.{scenario} "
+                f"accuracy={stats.get('accuracy', 0.0):.4f} "
+                f"correct={stats.get('correct_questions', 0)}/{stats.get('total_questions', 0)} "
+                f"valid={stats.get('valid_answer_count', 0)} "
+                f"invalid={stats.get('invalid_answer_count', 0)}"
+            )
+        pairs = physion_pp_ocp.get("pairs", {})
+        if pairs.get("total_pairs", 0):
+            terminal_print(
+                "[metrics] physion_pp_ocp_pairs "
+                f"total={pairs.get('total_pairs', 0)} "
+                f"valid={pairs.get('valid_pairs', 0)} "
+                f"invalid={pairs.get('invalid_pairs', 0)} "
+                f"incomplete={pairs.get('incomplete_pairs', 0)} "
+                f"both_correct_rate={pairs.get('both_correct_rate', 0.0):.4f} "
+                f"differentiated_rate={pairs.get('differentiated_rate', 0.0):.4f}"
+            )
+        status_counts = physion_pp_ocp.get("status_counts", {})
+        terminal_print(
+            "[metrics] physion_pp_ocp_status "
+            f"request_error={status_counts.get('request_error', 0)} "
+            f"parse_error={status_counts.get('parse_error', 0)} "
+            f"wrong_answer={status_counts.get('wrong_answer', 0)} "
+            f"correct={status_counts.get('correct', 0)}"
+        )
 
 def print_run_info(args: argparse.Namespace, question_types: list[str]) -> None:
     family = infer_model_family(args.model or "")
@@ -267,6 +311,11 @@ def main() -> None:
                 f"Unknown Physion++ baseline scenarios: {unknown_scenarios}; "
                 f"expected subset of {list(PHYSION_PP_BASELINE_SCENARIOS)}"
             )
+    if args.dataset_root is None:
+        if args.bench == "physion_pp":
+            args.dataset_root = str(default_physion_pp_root())
+        else:
+            args.dataset_root = str(default_clevrer_root())
 
     config = build_model_config(
         provider=args.provider,
@@ -291,6 +340,62 @@ def main() -> None:
     args.provider = config.provider
     args.model = config.model
     print_run_info(args, question_types)
+    if args.bench == "clevrer" and args.mode == "direct-answer":
+        run_dir = run_clevrer_validation_direct_answer(
+            config=config,
+            dataset_root=args.dataset_root,
+            limit=args.limit,
+            scene_ids=scene_ids,
+            question_types=question_types,
+            num_workers=args.num_workers,
+            resume_run_dir=args.resume_run_dir,
+            resume_rerun_statuses=resume_rerun_statuses,
+            answer_format=args.answer_format,
+        )
+    elif args.bench == "clevrer" and args.mode == "world-model-agent":
+        run_dir = run_clevrer_validation_world_model_agent(
+            config=config,
+            dataset_root=args.dataset_root,
+            limit=args.limit,
+            scene_ids=scene_ids,
+            question_types=question_types,
+            dry_run=args.dry_run,
+            stop_after_stage=args.stop_after_stage,
+            debug_artifacts=args.debug_artifacts,
+            persistent_workers=not args.no_persistent_workers,
+            resume_run_dir=args.resume_run_dir,
+        )
+    elif args.bench == "physion_pp" and args.mode == "direct-answer":
+        run_dir = run_physion_pp_test_direct_answer(
+            config=config,
+            dataset_root=args.dataset_root,
+            limit=args.limit,
+            scene_ids=scene_ids,
+            question_types=question_types,
+            num_workers=args.num_workers,
+            properties=physion_pp_properties,
+            scenarios=physion_pp_scenarios,
+            run_dir=args.run_dir,
+            resume_run_dir=args.resume_run_dir,
+            resume_rerun_statuses=resume_rerun_statuses,
+        )
+    elif args.bench == "physion_pp" and args.mode == "world-model-agent":
+        run_dir = run_physion_pp_test_world_model_agent(
+            config=config,
+            dataset_root=args.dataset_root,
+            limit=args.limit,
+            scene_ids=scene_ids,
+            question_types=question_types,
+            dry_run=args.dry_run,
+            stop_after_stage=args.stop_after_stage,
+            debug_artifacts=args.debug_artifacts,
+            persistent_workers=not args.no_persistent_workers,
+            resume_run_dir=args.resume_run_dir,
+            properties=physion_pp_properties,
+            enabled_route_options=enabled_route_options,
+        )
+    else:
+        raise ValueError(f"Unsupported bench/mode combination: bench={args.bench} mode={args.mode}")
     print_metrics_summary(str(run_dir))
     print(run_dir)
 

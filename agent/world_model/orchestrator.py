@@ -31,6 +31,12 @@ from agent.world_model.planner import (
     build_track_bootstrap_scene_object_plan,
     build_vlm_scene_assessment,
 )
+from agent.world_model.route_policy import (
+    RouteContext,
+    RoutePolicy,
+    RoutePolicyValidationError,
+    load_route_policy,
+)
 from agent.world_model.sam3d_worker import SAM3DWorkerClient
 from agent.world_model.sam3_video_tracks_worker import SAM3VideoTracksWorkerClient
 from agent.world_model.schemas import ObjectPlan, TargetObject, ToolResult, WorldModelQuestionResult
@@ -46,6 +52,15 @@ from benchmark.metrics import (
     compute_metrics,
     compute_physion_pp_metrics,
     normalize_descriptive_answer,
+)
+from benchmark.physion_pp import (
+    PHYSION_PP_RUN_CUE_VIDEO_DIRNAME,
+    RIGID_SCENARIOS,
+    PhysionPPQuestion,
+    PhysionPPScene,
+    load_test_scenes as load_physion_pp_test_scenes,
+    resolve_cue_clip_scenes,
+    stage_cue_clips_into_run_dir,
 )
 from utils.config import ModelConfig
 from utils.run import ensure_run_dir, write_json
@@ -104,6 +119,9 @@ TRACK_VLM_LABELING_DECISION_ID = "LBL-001.track_vlm_labeling"
 CLEVRER_TRACK_VLM_LABELING_ROUTE = (
     "label.vlm_geometry_basic"
 )
+PHYSION_PP_TRACK_VLM_LABELING_ROUTE = (
+    "label.vlm_geometry_concave"
+)
 TRACK_VLM_LABELING_ROUTE_BY_BENCHMARK = {
     "clevrer": CLEVRER_TRACK_VLM_LABELING_ROUTE,
     "physion_pp": PHYSION_PP_TRACK_VLM_LABELING_ROUTE,
@@ -144,8 +162,37 @@ MESH_CONDITIONING_DECISION_ID = "GEO-004.mesh_conditioning"
 CLEVRER_MESH_CONDITIONING_ROUTE = (
     "mesh_conditioning.aabb_no_guard"
 )
+PHYSION_PP_WARN_ONLY_MESH_CONDITIONING_ROUTE = (
+    "mesh_conditioning.obb_warn"
+)
+PHYSION_PP_ROLLBACK_MESH_CONDITIONING_ROUTE = (
+    "mesh_conditioning.obb_rollback"
+)
+PHYSION_PP_WARN_ONLY_MESH_CONDITIONING_SCENARIOS = frozenset(
+    {
+        "friction_platform_pp",
+        "bouncy_platform_pp",
+        "friction_collision_pp",
+        "mass_collision_pp",
+    }
+)
 
 
+def _expected_mesh_conditioning_route(
+    benchmark: str,
+    scenario: str | None,
+) -> str | None:
+    if benchmark == "clevrer":
+        return CLEVRER_MESH_CONDITIONING_ROUTE
+    normalized_scenario = str(scenario or "").strip().lower()
+    if benchmark == "physion_pp" and normalized_scenario == "bouncy_wall_pp":
+        return PHYSION_PP_ROLLBACK_MESH_CONDITIONING_ROUTE
+    if (
+        benchmark == "physion_pp"
+        and normalized_scenario in PHYSION_PP_WARN_ONLY_MESH_CONDITIONING_SCENARIOS
+    ):
+        return PHYSION_PP_WARN_ONLY_MESH_CONDITIONING_ROUTE
+    return None
 POSE_INPUT_AND_FOUNDATIONPOSE_DECISION_ID = (
     "POS-001.pose_input_and_foundationpose"
 )
@@ -339,20 +386,164 @@ TOOL_TO_DISPLAY_STAGE = {
 }
 
 
+def _resolve_world_model_video_source(
+    benchmark: str,
+    *,
+    policy: RoutePolicy | None = None,
+) -> tuple[dict[str, Any], bool]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        WORLD_MODEL_VIDEO_SOURCE_DECISION_ID,
+        RouteContext(benchmark=benchmark),
+    )
+    route = resolved_route["route"]
+    if route == "video.original":
+        trim_cue_flash = False
+    elif route == "video.cue_trimmed":
+        trim_cue_flash = True
+    else:
+        raise RoutePolicyValidationError(
+            f"unsupported world-model video source route: {route!r}"
+        )
+    return resolved_route, trim_cue_flash
 
 
+def _resolve_answer_fallback_video_source(
+    benchmark: str,
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        ANSWER_FALLBACK_VIDEO_SOURCE_DECISION_ID,
+        RouteContext(benchmark=benchmark),
+    )
+    route = resolved_route["route"]
+    if route not in {"video.original", "video.cue_annotated"}:
+        raise RoutePolicyValidationError(
+            f"unsupported answer-fallback video source route: {route!r}"
+        )
+    return resolved_route
 
 
+def _resolve_success_answer_backend(
+    benchmark: str,
+    *,
+    scenario: str | None,
+    question_type: str | None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        SUCCESS_ANSWER_BACKEND_DECISION_ID,
+        RouteContext(
+            benchmark=benchmark,
+            scenario=scenario,
+            question_type=question_type,
+        ),
+    )
+    route = resolved_route["route"]
+    if route not in SUCCESS_ANSWER_BACKEND_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported success-answer backend route: {route!r}"
+        )
+    return resolved_route
 
 
+def _resolve_world_model_answer_fallback(
+    benchmark: str,
+    *,
+    scenario: str | None,
+    question_type: str | None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        WORLD_MODEL_ANSWER_FALLBACK_DECISION_ID,
+        RouteContext(
+            benchmark=benchmark,
+            scenario=scenario,
+            question_type=question_type,
+        ),
+    )
+    route = resolved_route["route"]
+    if route != WORLD_MODEL_ANSWER_FALLBACK_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported world-model answer-fallback route: {route!r}"
+        )
+    return resolved_route
 
 
+def _resolve_temporal_partition(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        TEMPORAL_PARTITION_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route not in TEMPORAL_PARTITION_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported temporal-partition route: {route!r}"
+        )
+    return resolved_route
 
 
+def _record_temporal_partition_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != TEMPORAL_PARTITION_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "temporal-partition route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in TEMPORAL_PARTITION_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported temporal-partition route: {route!r}"
+        )
+    object_plan.special_scene["temporal_partition_route"] = resolved_route
 
 
+def _resolve_scene_assessment_bundle(
+    benchmark: str,
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        SCENE_ASSESSMENT_BUNDLE_DECISION_ID,
+        RouteContext(benchmark=benchmark),
+    )
+    route = resolved_route["route"]
+    if route != SCENE_VLM_HORIZONTAL_ROLL_SUPPORT_BUNDLE_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported scene-assessment route: {route!r}"
+        )
+    return resolved_route
 
 
+def _resolve_object_inventory_source(
+    benchmark: str,
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        OBJECT_INVENTORY_SOURCE_DECISION_ID,
+        RouteContext(benchmark=benchmark),
+    )
+    route = resolved_route["route"]
+    if route != TRACK_BOOTSTRAP_THEN_TRACK_DERIVED_INVENTORY_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported object-inventory route: {route!r}"
+        )
+    return resolved_route
 
 
 def _resolve_tracking_family(
@@ -374,18 +565,129 @@ def _resolve_tracking_family(
     return resolved_route
 
 
+def _record_tracking_family_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != TRACKING_FAMILY_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "tracking-family route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in TRACKING_FAMILY_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported tracking-family route: {route!r}"
+        )
+    object_plan.special_scene["tracking_family_route"] = resolved_route
 
 
+def _resolve_cue_role_binding(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        CUE_ROLE_BINDING_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route != CUE_ROLE_BINDING_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported cue-role-binding route: {route!r}"
+        )
+    return resolved_route
 
 
+def _record_cue_role_binding_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != CUE_ROLE_BINDING_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "cue-role-binding route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route != CUE_ROLE_BINDING_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported cue-role-binding route: {route!r}"
+        )
+    object_plan.special_scene["cue_role_binding_route"] = resolved_route
 
 
+def _resolve_static_role_assignment(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        STATIC_ROLE_ASSIGNMENT_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route not in STATIC_ROLE_ASSIGNMENT_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported static-role-assignment route: {route!r}"
+        )
+    return resolved_route
 
 
+def _record_static_role_assignment_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != STATIC_ROLE_ASSIGNMENT_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "static-role-assignment route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in STATIC_ROLE_ASSIGNMENT_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported static-role-assignment route: {route!r}"
+        )
+    object_plan.special_scene["static_role_assignment_route"] = resolved_route
 
 
+def _resolve_cross_segment_identity(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        CROSS_SEGMENT_IDENTITY_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route not in CROSS_SEGMENT_IDENTITY_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported cross-segment-identity route: {route!r}"
+        )
+    return resolved_route
 
 
+def _record_cross_segment_identity_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != CROSS_SEGMENT_IDENTITY_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "cross-segment-identity route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in CROSS_SEGMENT_IDENTITY_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported cross-segment-identity route: {route!r}"
+        )
+    object_plan.special_scene["cross_segment_identity_route"] = resolved_route
 
 
 def _resolve_mass_extra_patient_link(
@@ -407,10 +709,66 @@ def _resolve_mass_extra_patient_link(
     return resolved_route
 
 
+def _record_mass_extra_patient_link_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != MASS_EXTRA_PATIENT_LINK_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "mass-extra-patient-link route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route != MASS_EXTRA_PATIENT_LINK_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported mass-extra-patient-link route: {route!r}"
+        )
+    object_plan.special_scene["mass_extra_patient_link_route"] = resolved_route
 
 
+def _resolve_track_vlm_labeling(
+    benchmark: str,
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        TRACK_VLM_LABELING_DECISION_ID,
+        RouteContext(benchmark=benchmark),
+    )
+    route = resolved_route["route"]
+    expected_route = TRACK_VLM_LABELING_ROUTE_BY_BENCHMARK.get(benchmark)
+    if route != expected_route:
+        raise RoutePolicyValidationError(
+            "track-VLM-labeling route does not match its benchmark: "
+            f"{route!r} != {expected_route!r}"
+        )
+    return resolved_route
 
 
+def _record_track_vlm_labeling_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != TRACK_VLM_LABELING_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "track-VLM-labeling route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    context = resolved_route.get("context")
+    benchmark = (
+        str(context.get("benchmark") or "").strip().lower()
+        if isinstance(context, dict)
+        else ""
+    )
+    expected_route = TRACK_VLM_LABELING_ROUTE_BY_BENCHMARK.get(benchmark)
+    if route != expected_route:
+        raise RoutePolicyValidationError(
+            "track-VLM-labeling route does not match its recorded benchmark: "
+            f"{route!r} != {expected_route!r}"
+        )
+    object_plan.special_scene["track_vlm_labeling_route"] = resolved_route
 
 
 def _resolve_false_positive_advice_effect(
@@ -431,14 +789,92 @@ def _resolve_false_positive_advice_effect(
     return resolved_route
 
 
+def _record_false_positive_advice_effect_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != FALSE_POSITIVE_ADVICE_EFFECT_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "false-positive-advice-effect route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route != FALSE_POSITIVE_ADVICE_EFFECT_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported false-positive-advice-effect route: {route!r}"
+        )
+    object_plan.special_scene["false_positive_advice_effect_route"] = resolved_route
 
 
+def _resolve_intrinsics_backend(
+    benchmark: str,
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        INTRINSICS_BACKEND_DECISION_ID,
+        RouteContext(benchmark=benchmark),
+    )
+    route = resolved_route["route"]
+    if route != INTRINSICS_BACKEND_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported intrinsics-backend route: {route!r}"
+        )
+    return resolved_route
 
 
+def _record_intrinsics_backend_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != INTRINSICS_BACKEND_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "intrinsics-backend route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route != INTRINSICS_BACKEND_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported intrinsics-backend route: {route!r}"
+        )
+    object_plan.special_scene["intrinsics_backend_route"] = resolved_route
 
 
+def _resolve_depth_partition(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        DEPTH_PARTITION_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route not in DEPTH_PARTITION_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported depth-partition route: {route!r}"
+        )
+    return resolved_route
 
 
+def _record_depth_partition_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != DEPTH_PARTITION_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "depth-partition route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in DEPTH_PARTITION_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported depth-partition route: {route!r}"
+        )
+    object_plan.special_scene["depth_partition_route"] = resolved_route
 
 
 def _resolve_segment_depth_alignment(
@@ -460,6 +896,21 @@ def _resolve_segment_depth_alignment(
     return resolved_route
 
 
+def _record_segment_depth_alignment_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != SEGMENT_DEPTH_ALIGNMENT_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "segment-depth-alignment route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route != SEGMENT_DEPTH_ALIGNMENT_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported segment-depth-alignment route: {route!r}"
+        )
+    object_plan.special_scene["segment_depth_alignment_route"] = resolved_route
 
 
 def _resolve_sam3d_observation_selection(
@@ -481,14 +932,113 @@ def _resolve_sam3d_observation_selection(
     return resolved_route
 
 
+def _record_sam3d_observation_selection_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if (
+        resolved_route.get("decision_id")
+        != SAM3D_OBSERVATION_SELECTION_DECISION_ID
+    ):
+        raise RoutePolicyValidationError(
+            "SAM3D-observation-selection route record has an unexpected "
+            f"decision_id: {resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in SAM3D_OBSERVATION_SELECTION_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported SAM3D-observation-selection route: {route!r}"
+        )
+    object_plan.special_scene["sam3d_observation_selection_route"] = (
+        resolved_route
+    )
 
 
+def _resolve_cross_segment_mesh_reuse(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        CROSS_SEGMENT_MESH_REUSE_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route not in CROSS_SEGMENT_MESH_REUSE_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported cross-segment-mesh-reuse route: {route!r}"
+        )
+    return resolved_route
 
 
+def _record_cross_segment_mesh_reuse_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != CROSS_SEGMENT_MESH_REUSE_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "cross-segment-mesh-reuse route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in CROSS_SEGMENT_MESH_REUSE_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported cross-segment-mesh-reuse route: {route!r}"
+        )
+    object_plan.special_scene["cross_segment_mesh_reuse_route"] = resolved_route
 
 
+def _resolve_mesh_conditioning(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        MESH_CONDITIONING_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    expected_route = _expected_mesh_conditioning_route(benchmark, scenario)
+    if route != expected_route:
+        raise RoutePolicyValidationError(
+            "mesh-conditioning route does not match its benchmark/scenario: "
+            f"{route!r} != {expected_route!r}"
+        )
+    return resolved_route
 
 
+def _record_mesh_conditioning_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != MESH_CONDITIONING_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "mesh-conditioning route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    context = resolved_route.get("context")
+    benchmark = (
+        str(context.get("benchmark") or "").strip().lower()
+        if isinstance(context, dict)
+        else ""
+    )
+    scenario = (
+        str(context.get("scenario") or "").strip().lower()
+        if isinstance(context, dict)
+        else ""
+    )
+    expected_route = _expected_mesh_conditioning_route(benchmark, scenario)
+    if route != expected_route:
+        raise RoutePolicyValidationError(
+            "mesh-conditioning route does not match its recorded context: "
+            f"{route!r} != {expected_route!r}"
+        )
+    object_plan.special_scene["mesh_conditioning_route"] = resolved_route
 
 
 def _resolve_pose_input_and_foundationpose(
@@ -510,70 +1060,602 @@ def _resolve_pose_input_and_foundationpose(
     return resolved_route
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def _record_pose_input_and_foundationpose_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if (
+        resolved_route.get("decision_id")
+        != POSE_INPUT_AND_FOUNDATIONPOSE_DECISION_ID
+    ):
+        raise RoutePolicyValidationError(
+            "pose-input-and-FoundationPose route record has an unexpected "
+            f"decision_id: {resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route != POSE_INPUT_AND_FOUNDATIONPOSE_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported pose-input-and-FoundationPose route: {route!r}"
+        )
+    object_plan.special_scene["pose_input_and_foundationpose_route"] = (
+        resolved_route
+    )
+
+
+def _resolve_ground_motion_gate(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        GROUND_MOTION_GATE_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route not in GROUND_MOTION_GATE_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported ground-motion-gate route: {route!r}"
+        )
+    return resolved_route
+
+
+def _record_ground_motion_gate_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != GROUND_MOTION_GATE_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "ground-motion-gate route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in GROUND_MOTION_GATE_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported ground-motion-gate route: {route!r}"
+        )
+    object_plan.special_scene["ground_motion_gate_route"] = resolved_route
+
+
+def _resolve_gravity_estimator(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        GRAVITY_ESTIMATOR_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route not in GRAVITY_ESTIMATOR_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported gravity-estimator route: {route!r}"
+        )
+    return resolved_route
+
+
+def _resolve_gravity_constraints(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        GRAVITY_CONSTRAINTS_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route not in GRAVITY_CONSTRAINT_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported gravity-constraints route: {route!r}"
+        )
+    return resolved_route
+
+
+def _record_gravity_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    decision_id = resolved_route.get("decision_id")
+    if decision_id == GRAVITY_ESTIMATOR_DECISION_ID:
+        routes = GRAVITY_ESTIMATOR_ROUTES
+        key = "gravity_estimator_route"
+    elif decision_id == GRAVITY_CONSTRAINTS_DECISION_ID:
+        routes = GRAVITY_CONSTRAINT_ROUTES
+        key = "gravity_constraints_route"
+    else:
+        raise RoutePolicyValidationError(
+            "gravity route record has an unexpected decision_id: "
+            f"{decision_id!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in routes:
+        raise RoutePolicyValidationError(
+            f"unsupported gravity route for {decision_id}: {route!r}"
+        )
+    object_plan.special_scene[key] = resolved_route
+
+
+def _resolve_rotation_policy(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        ROTATION_POLICY_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+    )
+    route = resolved_route["route"]
+    if route != ROTATION_POLICY_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported rotation-policy route: {route!r}"
+        )
+    return resolved_route
+
+
+def _record_rotation_policy_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    if resolved_route.get("decision_id") != ROTATION_POLICY_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "rotation-policy route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route != ROTATION_POLICY_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported rotation-policy route: {route!r}"
+        )
+    object_plan.special_scene["rotation_policy_route"] = resolved_route
+
+
+def _resolve_pose_route(
+    decision_id: str,
+    supported_routes: frozenset[str],
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    role: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        decision_id,
+        RouteContext(benchmark=benchmark, scenario=scenario, role=role),
+    )
+    route = resolved_route["route"]
+    if route not in supported_routes:
+        raise RoutePolicyValidationError(
+            f"unsupported route for {decision_id}: {route!r}"
+        )
+    return resolved_route
+
+
+def _record_pose_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+    *,
+    decision_id: str,
+    supported_routes: frozenset[str],
+    key: str,
+) -> None:
+    if resolved_route.get("decision_id") != decision_id:
+        raise RoutePolicyValidationError(
+            f"{key} has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route not in supported_routes:
+        raise RoutePolicyValidationError(
+            f"unsupported route for {decision_id}: {route!r}"
+        )
+    object_plan.special_scene[key] = resolved_route
+
+
+def _resolve_support_snap(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        SUPPORT_SNAP_DECISION_ID,
+        SUPPORT_SNAP_ROUTES,
+        benchmark,
+        scenario=scenario,
+        policy=policy,
+    )
+
+
+def _resolve_static_fixture_flush(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        STATIC_FIXTURE_FLUSH_DECISION_ID,
+        STATIC_FIXTURE_FLUSH_ROUTES,
+        benchmark,
+        scenario=scenario,
+        policy=policy,
+    )
+
+
+def _resolve_line_layout(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        LINE_LAYOUT_DECISION_ID,
+        LINE_LAYOUT_ROUTES,
+        benchmark,
+        scenario=scenario,
+        policy=policy,
+    )
+
+
+def _resolve_foundationpose_agent_geometry(
+    benchmark: str,
+    *,
+    scenario: str,
+    enabled_route_options: Sequence[str] = (),
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        FOUNDATIONPOSE_AGENT_GEOMETRY_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario, role="agent"),
+        enabled_option_ids=enabled_route_options,
+    )
+    route = resolved_route["route"]
+    if route not in FOUNDATIONPOSE_AGENT_GEOMETRY_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported FoundationPose agent-geometry route: {route!r}"
+        )
+    return resolved_route
+
+
+def _resolve_agent_trajectory(
+    benchmark: str,
+    *,
+    scenario: str,
+    enabled_route_options: Sequence[str] = (),
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any] | None:
+    decision_id = AGENT_TRAJECTORY_DECISION_BY_SCENARIO.get(scenario)
+    if decision_id is None:
+        return None
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        decision_id,
+        RouteContext(benchmark=benchmark, scenario=scenario, role="agent"),
+        enabled_option_ids=enabled_route_options,
+    )
+    route = resolved_route["route"]
+    if route not in AGENT_TRAJECTORY_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported agent-trajectory route for {decision_id}: {route!r}"
+        )
+    return resolved_route
+
+
+def _resolve_collision_patient_motion_gate(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        COLLISION_PATIENT_MOTION_GATE_DECISION_ID,
+        frozenset({COLLISION_PATIENT_MOTION_GATE_ROUTE}),
+        benchmark,
+        scenario=scenario,
+        role="patient",
+        policy=policy,
+    )
+
+
+def _resolve_collision_patient_drop(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        COLLISION_PATIENT_DROP_DECISION_ID,
+        frozenset({COLLISION_PATIENT_DROP_ROUTE}),
+        benchmark,
+        scenario=scenario,
+        role="patient",
+        policy=policy,
+    )
+
+
+def _resolve_mass_extra_mesh_adopt(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        MASS_EXTRA_MESH_ADOPT_DECISION_ID,
+        frozenset({MASS_EXTRA_MESH_ADOPT_ROUTE}),
+        benchmark,
+        scenario=scenario,
+        role="patient",
+        policy=policy,
+    )
+
+
+def _resolve_mass_agent_flush(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        MASS_AGENT_FLUSH_DECISION_ID,
+        frozenset({MASS_AGENT_FLUSH_ROUTE}),
+        benchmark,
+        scenario=scenario,
+        role="agent",
+        policy=policy,
+    )
+
+
+def _resolve_mass_ball_trajectory(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        MASS_BALL_TRAJECTORY_DECISION_ID,
+        frozenset({MASS_BALL_TRAJECTORY_ROUTE}),
+        benchmark,
+        scenario=scenario,
+        role="ball",
+        policy=policy,
+    )
+
+
+def _resolve_swr_fit_backend(
+    benchmark: str,
+    *,
+    scenario: str | None = None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        SWR_FIT_BACKEND_DECISION_ID,
+        SWR_FIT_BACKEND_ROUTES,
+        benchmark,
+        scenario=scenario,
+        policy=policy,
+    )
+
+
+def _record_swr_fit_backend_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    _record_pose_route(
+        object_plan,
+        resolved_route,
+        decision_id=SWR_FIT_BACKEND_DECISION_ID,
+        supported_routes=SWR_FIT_BACKEND_ROUTES,
+        key="swr_fit_backend_route",
+    )
+
+
+def _resolve_swr_fit_strategy(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        SWR_FIT_STRATEGY_DECISION_ID,
+        SWR_FIT_STRATEGY_ROUTES,
+        benchmark,
+        scenario=scenario,
+        policy=policy,
+    )
+
+
+def _record_swr_fit_strategy_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    _record_pose_route(
+        object_plan,
+        resolved_route,
+        decision_id=SWR_FIT_STRATEGY_DECISION_ID,
+        supported_routes=SWR_FIT_STRATEGY_ROUTES,
+        key="swr_fit_strategy_route",
+    )
+
+
+def _resolve_swr_fit_geometry_source(
+    benchmark: str,
+    *,
+    scenario: str,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    return _resolve_pose_route(
+        SWR_FIT_GEOMETRY_SOURCE_DECISION_ID,
+        frozenset({SWR_FIT_GEOMETRY_SOURCE_ROUTE}),
+        benchmark,
+        scenario=scenario,
+        policy=policy,
+    )
+
+
+def _record_swr_fit_geometry_source_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    _record_pose_route(
+        object_plan,
+        resolved_route,
+        decision_id=SWR_FIT_GEOMETRY_SOURCE_DECISION_ID,
+        supported_routes=frozenset({SWR_FIT_GEOMETRY_SOURCE_ROUTE}),
+        key="swr_fit_geometry_source_route",
+    )
+
+
+def _resolve_swr_visual_pose_preservation(
+    benchmark: str,
+    *,
+    scenario: str,
+    enabled_route_options: tuple[str, ...] = (),
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        SWR_VISUAL_POSE_PRESERVATION_DECISION_ID,
+        RouteContext(benchmark=benchmark, scenario=scenario),
+        enabled_option_ids=enabled_route_options,
+    )
+    route = resolved_route["route"]
+    if route not in SWR_VISUAL_POSE_PRESERVATION_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported SWR visual-pose-preservation route: {route!r}"
+        )
+    return resolved_route
+
+
+def _record_swr_visual_pose_preservation_route(
+    object_plan: ObjectPlan,
+    resolved_route: dict[str, Any],
+) -> None:
+    _record_pose_route(
+        object_plan,
+        resolved_route,
+        decision_id=SWR_VISUAL_POSE_PRESERVATION_DECISION_ID,
+        supported_routes=SWR_VISUAL_POSE_PRESERVATION_ROUTES,
+        key="swr_visual_pose_preservation_route",
+    )
+
+
+def _resolve_question_rollout_backend(
+    benchmark: str,
+    *,
+    scenario: str | None,
+    question_type: str | None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        QUESTION_ROLLOUT_BACKEND_DECISION_ID,
+        RouteContext(
+            benchmark=benchmark,
+            scenario=scenario,
+            question_type=question_type,
+        ),
+    )
+    route = resolved_route["route"]
+    if route not in QUESTION_ROLLOUT_BACKEND_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported question-rollout backend route: {route!r}"
+        )
+    return resolved_route
+
+
+def _resolve_clevrer_tool_planning(
+    benchmark: str,
+    *,
+    question_type: str | None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        CLEVRER_TOOL_PLANNING_DECISION_ID,
+        RouteContext(
+            benchmark=benchmark,
+            question_type=question_type,
+        ),
+    )
+    route = resolved_route["route"]
+    if route != CLEVRER_TOOL_PLANNING_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported CLEVRER tool-planning route: {route!r}"
+        )
+    return resolved_route
+
+
+def _record_agent_geometry_and_trajectory_routes(
+    object_plan: ObjectPlan,
+    *,
+    geometry_route: dict[str, Any],
+    trajectory_route: dict[str, Any] | None,
+) -> None:
+    if geometry_route.get("decision_id") != FOUNDATIONPOSE_AGENT_GEOMETRY_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "FoundationPose agent-geometry route record has an unexpected decision_id: "
+            f"{geometry_route.get('decision_id')!r}"
+        )
+    if geometry_route.get("route") not in FOUNDATIONPOSE_AGENT_GEOMETRY_ROUTES:
+        raise RoutePolicyValidationError(
+            "unsupported FoundationPose agent-geometry route: "
+            f"{geometry_route.get('route')!r}"
+        )
+    object_plan.special_scene["foundationpose_agent_geometry_route"] = geometry_route
+    if trajectory_route is None:
+        return
+    if trajectory_route.get("decision_id") not in set(
+        AGENT_TRAJECTORY_DECISION_BY_SCENARIO.values()
+    ):
+        raise RoutePolicyValidationError(
+            "agent-trajectory route record has an unexpected decision_id: "
+            f"{trajectory_route.get('decision_id')!r}"
+        )
+    if trajectory_route.get("route") not in AGENT_TRAJECTORY_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported agent-trajectory route: {trajectory_route.get('route')!r}"
+        )
+    object_plan.special_scene["agent_trajectory_route"] = trajectory_route
+
+
+def _build_routed_track_bootstrap_object_plan(
+    scene: Any,
+    *,
+    scene_assessment: dict[str, Any] | None,
+    resolved_route: dict[str, Any],
+) -> ObjectPlan:
+    if resolved_route.get("decision_id") != OBJECT_INVENTORY_SOURCE_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "object-inventory route record has an unexpected decision_id: "
+            f"{resolved_route.get('decision_id')!r}"
+        )
+    route = resolved_route.get("route")
+    if route != TRACK_BOOTSTRAP_THEN_TRACK_DERIVED_INVENTORY_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported object-inventory route: {route!r}"
+        )
+    object_plan = build_track_bootstrap_scene_object_plan(
+        scene,
+        scene_assessment=scene_assessment,
+    )
+    object_plan.special_scene["object_inventory_route"] = resolved_route
+    return object_plan
+
+
+def _pipeline_policy_benchmark(scene: Any) -> str | None:
+    if isinstance(scene, PhysionPPScene):
+        return "physion_pp"
+    if isinstance(scene, ClevrerScene):
+        return "clevrer"
+    return None
 
 
 def _runs_through_stage(stop_after_stage: str, required_stage: str) -> bool:
@@ -716,10 +1798,69 @@ def _record_timing(result: ToolResult, elapsed: float) -> ToolResult:
     return result
 
 
+def _remove_tree(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
 
 
+def _remove_empty_dirs(path: Path) -> None:
+    if not path.is_dir():
+        return
+    for child in sorted(path.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if child.is_dir():
+            try:
+                child.rmdir()
+            except OSError:
+                pass
 
 
+def _trim_video_metric_depth_sidecar(video_metric_depth_path: Path) -> None:
+    if not video_metric_depth_path.exists():
+        return
+    try:
+        payload = json.loads(video_metric_depth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    sidecar = payload.get("tensor_sidecar") if isinstance(payload, dict) else None
+    if not sidecar:
+        return
+    sidecar_path = Path(str(sidecar))
+    if not sidecar_path.exists():
+        return
+    try:
+        with np.load(str(sidecar_path)) as arrays:
+            if "intrinsics" not in arrays:
+                return
+            intrinsics = np.asarray(arrays["intrinsics"])
+            metric_depth = np.asarray(arrays["metric_depth"]) if "metric_depth" in arrays else None
+        retained_arrays = {"intrinsics": intrinsics}
+        if metric_depth is not None:
+            retained_arrays["metric_depth"] = metric_depth
+        np.savez_compressed(sidecar_path, **retained_arrays)
+    except (OSError, ValueError, KeyError):
+        return
+    manifest = payload.get("tensor_manifest") if isinstance(payload.get("tensor_manifest"), dict) else {}
+    retained_names = list(retained_arrays)
+    retained_manifest = {
+        "intrinsics": {
+            "shape": list(intrinsics.shape),
+            "dtype": str(intrinsics.dtype),
+        }
+    }
+    if metric_depth is not None:
+        retained_manifest["metric_depth"] = {
+            "shape": list(metric_depth.shape),
+            "dtype": str(metric_depth.dtype),
+        }
+    payload["tensor_manifest_before_cleanup"] = manifest
+    payload["tensor_manifest"] = retained_manifest
+    payload["cleanup"] = {
+        "video_metric_depth_sidecar_trimmed": True,
+        "retained_arrays": retained_names,
+        "removed_arrays": [name for name in manifest if name not in retained_names],
+        "reason": "non-debug cleanup keeps camera intrinsics and metric depth required by mesh projection occlusion",
+    }
+    video_metric_depth_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _elapsed_text(result: ToolResult) -> str:
@@ -1744,6 +2885,8 @@ class WorldModelAgent:
         _remove_tree(self.artifacts.tool_dir(question_dir, "simulatable_world_reconstruction") / "debug")
 
     def cleanup_scene(self, scene: ClevrerScene) -> None:
+        if self.artifacts.debug_artifacts:
+            return
         scene_dir = self.run_dir / "artifacts" / f"scene_{scene.scene_index}"
         if not scene_dir.exists():
             return

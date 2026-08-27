@@ -1,0 +1,5 @@
+{
+  "provider": "openrouter",
+  "model": "google/gemini-3-flash-preview",
+  "input_mode": "full_video"
+}

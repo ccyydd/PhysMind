@@ -1,0 +1,18 @@
+[submodule "third_party/sam3"]
+	path = third_party/sam3
+	url = https://github.com/facebookresearch/sam3.git
+[submodule "third_party/sam-3d-objects"]
+	path = third_party/sam-3d-objects
+	url = https://github.com/facebookresearch/sam-3d-objects.git
+[submodule "third_party/FoundationPose"]
+	path = third_party/FoundationPose
+	url = https://github.com/ccyydd/FoundationPose.git
+[submodule "third_party/Video-Depth-Anything"]
+	path = third_party/Video-Depth-Anything
+	url = https://github.com/DepthAnything/Video-Depth-Anything.git
+[submodule "third_party/GeoCalib"]
+	path = third_party/GeoCalib
+	url = https://github.com/cvg/GeoCalib.git
+[submodule "third_party/MoGe"]
+	path = third_party/MoGe
+	url = https://github.com/microsoft/MoGe.git

@@ -19,8 +19,15 @@ from agent.direct_answer import (
 )
 from agent.query import answer_video_question, create_openai_compatible_client, extract_answer_tag
 from agent.world_model.artifacts import ArtifactManager
+from agent.world_model.route_policy import (
+    RouteContext,
+    RoutePolicy,
+    RoutePolicyValidationError,
+    load_route_policy,
+)
 from agent.world_model.schemas import ToolResult
 from benchmark.clevrer import ClevrerQuestion, ClevrerScene
+from benchmark.physion_pp import PhysionPPQuestion, PhysionPPScene
 from benchmark.prompts import build_descriptive_prompt, build_multiple_choice_prompt
 from benchmark.specs import CLEVRER_CHOICE_POLICY
 from utils.config import ModelConfig
@@ -31,6 +38,15 @@ SUCCESS_ANSWER_BACKEND_ROUTES = frozenset(
     {
         "answer.vlm_tools",
         "answer.contact_artifact",
+    }
+)
+PHYSION_PP_SUCCESS_ANSWER_SCENARIOS = frozenset(
+    {
+        "friction_platform_pp",
+        "bouncy_wall_pp",
+        "bouncy_platform_pp",
+        "friction_collision_pp",
+        "mass_collision_pp",
     }
 )
 WORLD_MODEL_ANSWER_FALLBACK_DECISION_ID = (
@@ -71,12 +87,159 @@ def _answer_policy_context(
     )
 
 
+def _resolve_success_answer_backend_route(
+    scene: Any,
+    question: Any,
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any] | None:
+    context = _answer_policy_context(scene, question)
+    if context is None:
+        return None
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        SUCCESS_ANSWER_BACKEND_DECISION_ID,
+        context,
+    )
+    if resolved_route.get("route") not in SUCCESS_ANSWER_BACKEND_ROUTES:
+        raise RoutePolicyValidationError(
+            "unsupported success-answer backend route: "
+            f"{resolved_route.get('route')!r}"
+        )
+    return resolved_route
 
 
+def _require_success_answer_backend_route(
+    route_record: dict[str, Any] | None,
+    *,
+    scene: Any,
+    question: Any,
+) -> dict[str, Any] | None:
+    context = _answer_policy_context(scene, question)
+    if context is None:
+        if route_record is not None:
+            raise RoutePolicyValidationError(
+                "success-answer backend route is not applicable to this benchmark"
+            )
+        return None
+    if route_record is None:
+        raise RoutePolicyValidationError(
+            "missing ANS-001 success-answer backend route record"
+        )
+    if route_record.get("decision_id") != SUCCESS_ANSWER_BACKEND_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "success-answer backend route has an unexpected decision_id: "
+            f"{route_record.get('decision_id')!r}"
+        )
+    route = str(route_record.get("route") or "")
+    if route not in SUCCESS_ANSWER_BACKEND_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported success-answer backend route: {route!r}"
+        )
+    record_context = route_record.get("context")
+    if not isinstance(record_context, dict):
+        raise RoutePolicyValidationError(
+            "success-answer backend route is missing context"
+        )
+    expected_context = {
+        "benchmark": context.benchmark,
+        "scenario": context.scenario,
+        "question_type": context.question_type,
+    }
+    observed_context = {
+        key: record_context.get(key)
+        for key in expected_context
+    }
+    if observed_context != expected_context:
+        raise RoutePolicyValidationError(
+            "success-answer backend route context mismatch: "
+            f"{observed_context!r} != {expected_context!r}"
+        )
+    expected_route = (
+        "answer.vlm_tools"
+        if context.benchmark == "clevrer"
+        else "answer.contact_artifact"
+        if context.scenario in PHYSION_PP_SUCCESS_ANSWER_SCENARIOS
+        else None
+    )
+    if route != expected_route:
+        raise RoutePolicyValidationError(
+            "success-answer backend route does not match benchmark/scenario: "
+            f"{route!r} != {expected_route!r}"
+        )
+    return route_record
 
 
+def _resolve_world_model_answer_fallback_route(
+    scene: Any,
+    question: Any,
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any] | None:
+    context = _answer_policy_context(scene, question)
+    if context is None:
+        return None
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        WORLD_MODEL_ANSWER_FALLBACK_DECISION_ID,
+        context,
+    )
+    if resolved_route.get("route") != WORLD_MODEL_ANSWER_FALLBACK_ROUTE:
+        raise RoutePolicyValidationError(
+            "unsupported world-model answer-fallback route: "
+            f"{resolved_route.get('route')!r}"
+        )
+    return resolved_route
 
 
+def _require_world_model_answer_fallback_route(
+    route_record: dict[str, Any] | None,
+    *,
+    scene: Any,
+    question: Any,
+) -> dict[str, Any]:
+    context = _answer_policy_context(scene, question)
+    if context is None:
+        raise RoutePolicyValidationError(
+            "world-model answer-fallback route is not applicable to this benchmark"
+        )
+    if route_record is None:
+        raise RoutePolicyValidationError(
+            "missing FAIL-001 world-model answer-fallback route record"
+        )
+    if (
+        route_record.get("decision_id")
+        != WORLD_MODEL_ANSWER_FALLBACK_DECISION_ID
+    ):
+        raise RoutePolicyValidationError(
+            "world-model answer-fallback route has an unexpected decision_id: "
+            f"{route_record.get('decision_id')!r}"
+        )
+    route = str(route_record.get("route") or "")
+    if route != WORLD_MODEL_ANSWER_FALLBACK_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported world-model answer-fallback route: {route!r}"
+        )
+    record_context = route_record.get("context")
+    if not isinstance(record_context, dict):
+        raise RoutePolicyValidationError(
+            "world-model answer-fallback route is missing context"
+        )
+    expected_context = {
+        "benchmark": context.benchmark,
+        "scenario": context.scenario,
+        "question_type": context.question_type,
+    }
+    observed_context = {
+        key: record_context.get(key)
+        for key in expected_context
+    }
+    if observed_context != expected_context:
+        raise RoutePolicyValidationError(
+            "world-model answer-fallback route context mismatch: "
+            f"{observed_context!r} != {expected_context!r}"
+        )
+    return route_record
 
 
 def _safe_json_loads(text: str) -> dict[str, Any]:

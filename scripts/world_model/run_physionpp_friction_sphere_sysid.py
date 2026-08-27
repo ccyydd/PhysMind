@@ -1721,8 +1721,249 @@ def _prepare_bounded_plane_hulls(
     return hulls
 
 
+def _render_bounded_plane_camera_debug(
+    *,
+    manifest: dict[str, Any],
+    result: dict[str, Any],
+    output_dir: Path,
+) -> Path | None:
+    import cv2
+
+    camera_intrinsic = sysid_common._camera_intrinsics_from_manifest(manifest)
+    if camera_intrinsic is None:
+        return None
+    metadata = manifest.get("video_metadata") if isinstance(manifest.get("video_metadata"), dict) else {}
+    width = int(metadata.get("width") or round(2.0 * float(camera_intrinsic[0][2])) or 256)
+    height = int(metadata.get("height") or round(2.0 * float(camera_intrinsic[1][2])) or 256)
+    fps = sysid_common._video_fps_from_manifest(manifest)
+    target = result.get("target_trajectories") if isinstance(result.get("target_trajectories"), dict) else {}
+    physics = result.get("physics_rollout") if isinstance(result.get("physics_rollout"), dict) else {}
+    simulated = physics.get("simulated_trajectories") if isinstance(physics.get("simulated_trajectories"), dict) else {}
+    best_params = result.get("alignment_optimization", {}).get("best_parameters", {})
+    if not simulated or not best_params:
+        return None
+    agent_id = next(iter(best_params.keys()))
+    records = simulated.get(agent_id)
+    if not isinstance(records, list) or not records:
+        return None
+    bounded_debug_path = ((physics.get("bounded_static_planes") or {}).get("debug_path") if isinstance(physics.get("bounded_static_planes"), dict) else None)
+    if not bounded_debug_path or not Path(str(bounded_debug_path)).exists():
+        return None
+    bounded_static_planes = _load_json(Path(str(bounded_debug_path)))
+    support_plane = physics.get("support_plane") if isinstance(physics.get("support_plane"), dict) else {}
+    selected_plane_id = str(support_plane.get("plane_id") or "")
+    if selected_plane_id:
+        bounded_static_planes = dict(bounded_static_planes)
+        bounded_static_planes["objects"] = [
+            {
+                **obj,
+                "planes": [
+                    plane
+                    for plane in obj.get("planes", [])
+                    if isinstance(plane, dict) and str(plane.get("plane_id")) == selected_plane_id
+                ],
+            }
+            for obj in bounded_static_planes.get("objects", [])
+            if isinstance(obj, dict)
+            and any(
+                isinstance(plane, dict) and str(plane.get("plane_id")) == selected_plane_id
+                for plane in obj.get("planes", [])
+            )
+        ]
+    target_records = sysid_common._target_records_from_swr(manifest)
+    static_ids = [object_id for object_id in target_records.keys() if object_id != agent_id]
+    static_meshes = _static_meshes_world(manifest=manifest, target=target_records, static_ids=static_ids)
+    hulls = _prepare_bounded_plane_hulls(
+        bounded_static_planes=bounded_static_planes,
+        static_meshes=static_meshes,
+        camera_intrinsic=camera_intrinsic,
+        width=width,
+        height=height,
+    )
+    frame_dir = _find_source_frame_dir(manifest)
+    output_path = output_dir / ("single_plane_camera_debug.mp4" if selected_plane_id else "bounded_planes_camera_debug.mp4")
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width * 2, height))
+    if not writer.isOpened():
+        return None
+    radius = float((best_params.get(agent_id) or {}).get("optimized_radius_m") or 0.0)
+    k = np.asarray(camera_intrinsic, dtype=np.float64).reshape(3, 3)
+    target_by_frame = {}
+    for record in target.get(agent_id, []) if isinstance(target.get(agent_id), list) else []:
+        if isinstance(record, dict) and record.get("frame_index") is not None:
+            target_by_frame[int(record["frame_index"])] = np.asarray(record.get("position"), dtype=np.float64)
+    for record in records:
+        frame_index = int(record.get("frame_index", 0))
+        left = _load_source_frame(frame_dir, frame_index, width, height)
+        right = np.full((height, width, 3), 245, dtype=np.uint8)
+        overlay = right.copy()
+        for hull in hulls:
+            pts = hull["hull"].reshape(-1, 1, 2)
+            color = tuple(int(value) for value in hull["color"])
+            cv2.fillPoly(overlay, [pts], color)
+            cv2.polylines(right, [pts], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+        right = cv2.addWeighted(overlay, 0.28, right, 0.72, 0.0)
+        for hull in hulls:
+            pts = hull["hull"].reshape(-1, 1, 2)
+            color = tuple(int(value) for value in hull["color"])
+            cv2.polylines(right, [pts], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+        position = np.asarray(record.get("position"), dtype=np.float64)
+        projected = _project_blender_to_pixel(position, camera_intrinsic)
+        if projected is not None:
+            u, v, z = projected
+            pixel_radius = max(3, int(round(abs(float(k[0, 0]) * radius / max(z, 1e-6)))))
+            center = (int(round(u)), int(round(v)))
+            cv2.circle(right, center, pixel_radius, (30, 30, 255), -1, lineType=cv2.LINE_AA)
+            cv2.circle(right, center, pixel_radius, (0, 0, 140), 2, lineType=cv2.LINE_AA)
+        target_position = target_by_frame.get(frame_index)
+        if target_position is not None:
+            projected_target = _project_blender_to_pixel(target_position, camera_intrinsic)
+            if projected_target is not None:
+                cv2.circle(right, (int(round(projected_target[0])), int(round(projected_target[1]))), 3, (0, 120, 0), -1, lineType=cv2.LINE_AA)
+        cv2.putText(left, f"source frame {frame_index}", (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        title = (
+            f"single slope plane {selected_plane_id} + sphere"
+            if selected_plane_id
+            else "bounded planes + simulated sphere"
+        )
+        cv2.putText(right, title, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (20, 20, 20), 1, cv2.LINE_AA)
+        cv2.putText(right, "red=sim sphere, green=target center", (8, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (20, 20, 20), 1, cv2.LINE_AA)
+        writer.write(np.concatenate([left, right], axis=1))
+    writer.release()
+    return output_path
 
 
+def _render_single_plane_topdown_debug(
+    *,
+    manifest: dict[str, Any],
+    result: dict[str, Any],
+    output_dir: Path,
+) -> Path | None:
+    import cv2
+
+    physics = result.get("physics_rollout") if isinstance(result.get("physics_rollout"), dict) else {}
+    support_plane = physics.get("support_plane") if isinstance(physics.get("support_plane"), dict) else {}
+    selected_plane_id = str(support_plane.get("plane_id") or "")
+    if not selected_plane_id:
+        return None
+    bounded_debug_path = ((physics.get("bounded_static_planes") or {}).get("debug_path") if isinstance(physics.get("bounded_static_planes"), dict) else None)
+    if not bounded_debug_path or not Path(str(bounded_debug_path)).exists():
+        return None
+    bounded = _load_json(Path(str(bounded_debug_path)))
+    plane_payload = None
+    mesh_path = None
+    for obj in bounded.get("objects", []):
+        if not isinstance(obj, dict):
+            continue
+        for plane in obj.get("planes", []):
+            if isinstance(plane, dict) and str(plane.get("plane_id")) == selected_plane_id:
+                plane_payload = plane
+                mesh_path = str(obj.get("mesh_path") or "")
+                break
+        if plane_payload is not None:
+            break
+    if plane_payload is None or not mesh_path:
+        return None
+
+    target = result.get("target_trajectories") if isinstance(result.get("target_trajectories"), dict) else {}
+    simulated = physics.get("simulated_trajectories") if isinstance(physics.get("simulated_trajectories"), dict) else {}
+    best_params = result.get("alignment_optimization", {}).get("best_parameters", {})
+    if not simulated or not best_params:
+        return None
+    agent_id = next(iter(best_params.keys()))
+    target_records = target.get(agent_id)
+    simulated_records = simulated.get(agent_id)
+    if not isinstance(target_records, list) or not isinstance(simulated_records, list):
+        return None
+
+    all_target = sysid_common._target_records_from_swr(manifest)
+    static_ids = [object_id for object_id in all_target if object_id != agent_id]
+    static_meshes = _static_meshes_world(manifest=manifest, target=all_target, static_ids=static_ids)
+    mesh = next((item for item in static_meshes if str(item.get("mesh_path")) == mesh_path), None)
+    if mesh is None:
+        return None
+    triangles = np.asarray(mesh["triangles"], dtype=np.float64).reshape(-1, 3, 3)
+    indices = [int(index) for index in plane_payload.get("triangle_indices", []) if 0 <= int(index) < len(triangles)]
+    if not indices:
+        return None
+    plane_vertices = triangles[np.asarray(indices, dtype=np.int64)].reshape(-1, 3)
+
+    gravity = np.asarray(support_plane.get("gravity_direction"), dtype=np.float64).reshape(3)
+    gravity /= max(float(np.linalg.norm(gravity)), 1e-12)
+    axis_u = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+    axis_u -= float(np.dot(axis_u, gravity)) * gravity
+    if float(np.linalg.norm(axis_u)) < 1e-6:
+        axis_u = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+        axis_u -= float(np.dot(axis_u, gravity)) * gravity
+    axis_u /= max(float(np.linalg.norm(axis_u)), 1e-12)
+    axis_v = np.cross(gravity, axis_u)
+    axis_v /= max(float(np.linalg.norm(axis_v)), 1e-12)
+
+    target_by_frame = {
+        int(record["frame_index"]): np.asarray(record["position"], dtype=np.float64)
+        for record in target_records
+        if isinstance(record, dict) and record.get("frame_index") is not None
+    }
+    simulated_by_frame = {
+        int(record["frame_index"]): np.asarray(record["position"], dtype=np.float64)
+        for record in simulated_records
+        if isinstance(record, dict) and record.get("frame_index") is not None
+    }
+    frames = sorted(set(target_by_frame) & set(simulated_by_frame))
+    if not frames:
+        return None
+
+    def project(points: np.ndarray) -> np.ndarray:
+        values = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        return np.stack([values @ axis_u, values @ axis_v], axis=1)
+
+    plane_2d = project(plane_vertices)
+    target_2d = project(np.stack([target_by_frame[frame] for frame in frames], axis=0))
+    simulated_2d = project(np.stack([simulated_by_frame[frame] for frame in frames], axis=0))
+    radius = float((best_params.get(agent_id) or {}).get("optimized_radius_m") or 0.0)
+    all_points = np.concatenate([plane_2d, target_2d, simulated_2d], axis=0)
+    lower = np.min(all_points, axis=0) - radius
+    upper = np.max(all_points, axis=0) + radius
+    span = np.maximum(upper - lower, 1e-6)
+    center = 0.5 * (lower + upper)
+    span *= 1.15
+    width, height = 640, 480
+    scale = min((width - 48) / span[0], (height - 72) / span[1])
+
+    def pixel(point: np.ndarray) -> tuple[int, int]:
+        x = width * 0.5 + (float(point[0]) - center[0]) * scale
+        y = height * 0.5 - (float(point[1]) - center[1]) * scale
+        return int(round(x)), int(round(y))
+
+    hull = cv2.convexHull(plane_2d.astype(np.float32)).reshape(-1, 2)
+    hull_px = np.asarray([pixel(point) for point in hull], dtype=np.int32).reshape(-1, 1, 2)
+    radius_px = max(3, int(round(radius * scale)))
+    output_path = output_dir / "single_plane_topdown_debug.mp4"
+    fps = sysid_common._video_fps_from_manifest(manifest)
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
+    if not writer.isOpened():
+        return None
+    for index, frame in enumerate(frames):
+        image = np.full((height, width, 3), 245, dtype=np.uint8)
+        overlay = image.copy()
+        cv2.fillPoly(overlay, [hull_px], (205, 225, 238))
+        image = cv2.addWeighted(overlay, 0.65, image, 0.35, 0.0)
+        cv2.polylines(image, [hull_px], True, (90, 110, 125), 2, cv2.LINE_AA)
+        if index > 0:
+            target_history = np.asarray([pixel(point) for point in target_2d[: index + 1]], dtype=np.int32)
+            simulated_history = np.asarray([pixel(point) for point in simulated_2d[: index + 1]], dtype=np.int32)
+            cv2.polylines(image, [target_history], False, (0, 150, 230), 2, cv2.LINE_AA)
+            cv2.polylines(image, [simulated_history], False, (40, 155, 65), 2, cv2.LINE_AA)
+        target_center = pixel(target_2d[index])
+        simulated_center = pixel(simulated_2d[index])
+        cv2.circle(image, target_center, radius_px, (0, 165, 245), -1, cv2.LINE_AA)
+        cv2.circle(image, target_center, radius_px, (0, 90, 150), 2, cv2.LINE_AA)
+        cv2.circle(image, simulated_center, radius_px, (55, 180, 75), -1, cv2.LINE_AA)
+        cv2.circle(image, simulated_center, radius_px, (20, 105, 35), 2, cv2.LINE_AA)
+        cv2.putText(image, f"top-down along -gravity | {selected_plane_id}", (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (25, 25, 25), 1, cv2.LINE_AA)
+        cv2.putText(image, f"frame {frame} | orange=target green=simulated", (12, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (25, 25, 25), 1, cv2.LINE_AA)
+        writer.write(image)
+    writer.release()
+    return output_path
 
 
 def run_physionpp_friction_sphere_sysid(
@@ -2206,6 +2447,17 @@ def main() -> None:
     _write_result_summary(output_dir=output_dir, result=result)
     debug_video_path = None
     topdown_debug_video_path = None
+    if args.render_video:
+        debug_video_path = _render_bounded_plane_camera_debug(
+            manifest=_load_json(Path(args.manifest)),
+            result=result,
+            output_dir=output_dir,
+        )
+        topdown_debug_video_path = _render_single_plane_topdown_debug(
+            manifest=_load_json(Path(args.manifest)),
+            result=result,
+            output_dir=output_dir,
+        )
     print(
         json.dumps(
             {

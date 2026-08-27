@@ -122,6 +122,8 @@ class ArtifactManager:
         return json.loads(path.read_text(encoding="utf-8"))
 
     def append_trace(self, event: Dict[str, Any]) -> None:
+        if not self.debug_artifacts:
+            return
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         with self.trace_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")

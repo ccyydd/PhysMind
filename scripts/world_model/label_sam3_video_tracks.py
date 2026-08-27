@@ -19,6 +19,9 @@ TRACK_VLM_LABELING_DECISION_ID = "LBL-001.track_vlm_labeling"
 CLEVRER_TRACK_VLM_LABELING_ROUTE = (
     "label.vlm_geometry_basic"
 )
+PHYSION_PP_TRACK_VLM_LABELING_ROUTE = (
+    "label.vlm_geometry_concave"
+)
 TRACK_VLM_LABELING_ROUTE_BY_BENCHMARK = {
     "clevrer": CLEVRER_TRACK_VLM_LABELING_ROUTE,
     "physion_pp": PHYSION_PP_TRACK_VLM_LABELING_ROUTE,

@@ -206,6 +206,7 @@ def export_label_inputs(
         representative_image_path = None
         representative_overlay_path = None
         selected_frame_image_path = None
+        selected_frame_image_fingerprint = None
         if representative_record:
             record = representative_record
             mask_key = str(record.get("mask_key") or "")
@@ -218,7 +219,6 @@ def export_label_inputs(
                 representative_overlay_path = track_dir / "representative_overlay.jpg"
                 representative_image_path = representative_overlay_path
                 cv2.imwrite(str(representative_overlay_path), overlay)
-                selected_frame_image_fingerprint = None
                 if write_selected_frame:
                     selected_frame_image_path = track_dir / "selected_frame.png"
                     cv2.imwrite(str(selected_frame_image_path), frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
@@ -261,9 +261,7 @@ def export_label_inputs(
                 "representative_overlay_path": str(representative_overlay_path) if representative_overlay_path else None,
                 "selected_frame_image": str(selected_frame_image_path) if selected_frame_image_path else None,
                 "selected_frame_image_format": "png" if selected_frame_image_path else None,
-                "selected_frame_image_fingerprint": _file_fingerprint(selected_frame_image_path)
-                if selected_frame_image_path
-                else None,
+                "selected_frame_image_fingerprint": selected_frame_image_fingerprint,
                 "representative_selection": representative_selection,
             }
         )

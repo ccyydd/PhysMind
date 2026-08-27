@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from agent.world_model.artifacts import artifact_path_by_name, question_root_from_output
+from scripts.world_model.occlusion_keyframe import select_occlusion_aware_keyframes
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -224,14 +225,91 @@ def _depth_to_sam3d_pointmap(depth: np.ndarray, pixel_k: np.ndarray, *, width: i
     return pointmap
 
 
+PHYSION_PP_STATIC_TRACK_PREFIX = "physion_pp_static_"
 
 
+def _load_video_frames_rgb(video: Path) -> np.ndarray:
+    capture = cv2.VideoCapture(str(video))
+    frames = []
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    capture.release()
+    if not frames:
+        raise ValueError(f"Unable to read any frame from video: {video}")
+    return np.stack(frames)
 
 
+def _track_mask_stack(masks: Any, track_id: str, n_frames: int, shape: tuple[int, int]) -> np.ndarray:
+    stack = np.zeros((n_frames, *shape), dtype=bool)
+    prefix = track_id + "__frame_"
+    for key in masks.files:
+        if key.startswith(prefix):
+            frame = int(key.split("__frame_")[1][:5])
+            if frame < n_frames:
+                stack[frame] = masks[key].astype(bool)
+    return stack
 
 
+def _mover_free_valid_stack(masks: Any, n_frames: int, shape: tuple[int, int]) -> tuple[np.ndarray, int]:
+    """Per frame/pixel validity: not covered by any non-static (moving) track's mask."""
+    mover_tracks = sorted({
+        key.split("__frame_")[0]
+        for key in masks.files
+        if not key.split("__frame_")[0].startswith(PHYSION_PP_STATIC_TRACK_PREFIX)
+    })
+    movers = np.zeros((n_frames, *shape), dtype=bool)
+    for track_id in mover_tracks:
+        movers |= _track_mask_stack(masks, track_id, n_frames, shape)
+    return ~movers, len(mover_tracks)
 
 
+def _physion_pp_static_temporal_composite(
+    *,
+    fixture_stack: np.ndarray,
+    valid_stack: np.ndarray,
+    frames_rgb: np.ndarray,
+    metric_depth: np.ndarray,
+    selected_mask: np.ndarray,
+    frame_index: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Temporal composite for a STATIC fixture under a MOVING occluder (friction_platform_pp):
+    per pixel, only the frames where no moving track covers the pixel are used, because the
+    friction agent starts slowly and can sit on one pixel for more than half the video, which
+    poisons plain medians/majorities. Pixels with zero mover-free frames (occluded in every
+    frame) keep the selected frame's values, i.e. degrade to today's behavior."""
+    n_frames = valid_stack.shape[0]
+    n_valid = valid_stack.sum(axis=0)
+    fallback = n_valid == 0
+
+    fixture_counts = (fixture_stack & valid_stack).sum(axis=0)
+    mask = fixture_counts > (n_valid / 2.0)
+    mask[fallback] = selected_mask[fallback]
+
+    rgb = frames_rgb[:n_frames].astype(np.float32)
+    rgb[~valid_stack] = np.nan
+    with np.errstate(all="ignore"):
+        image = np.nanmedian(rgb, axis=0)
+    image[fallback] = frames_rgb[frame_index][fallback]
+    image = image.astype(np.uint8)
+
+    depth = np.asarray(metric_depth[:n_frames], dtype=np.float32).copy()
+    depth[~valid_stack] = np.nan
+    with np.errstate(all="ignore"):
+        depth_median = np.nanmedian(depth, axis=0)
+    depth_median[fallback] = np.asarray(metric_depth[frame_index], dtype=np.float32)[fallback]
+
+    info = {
+        "applied": True,
+        "method": "per_pixel_mover_free_temporal_composite",
+        "statistics": "mask=majority, rgb=median, depth=median over mover-free frames per pixel",
+        "frame_count": int(n_frames),
+        "zero_mover_free_pixel_count": int(fallback.sum()),
+        "min_mover_free_frames": int(n_valid.min()),
+    }
+    return image, mask, depth_median, info
 
 
 def _sam3d_intrinsics_summary(
@@ -338,8 +416,77 @@ def load_sam3d_inference(*, config_path: Path, compile_model: bool) -> Any:
     return Inference(str(config_path), compile=compile_model)
 
 
+def _sam3d_observation_selection_route_from_object_plan(
+    object_plan_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    special = object_plan_payload.get("special_scene")
+    special = special if isinstance(special, dict) else {}
+    route_record = special.get("sam3d_observation_selection_route")
+    if not isinstance(route_record, dict):
+        metadata = special.get("scene_metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        benchmark = str(
+            special.get("benchmark") or metadata.get("benchmark") or ""
+        ).strip().lower()
+        scenario = str(
+            special.get("scenario") or metadata.get("scenario") or ""
+        ).strip().lower()
+        is_target_scope = (
+            benchmark == "clevrer" or scenario.endswith("_pp")
+        )
+        if is_target_scope:
+            raise ValueError(
+                "target SAM3D object plan is missing its observation-selection "
+                "route record"
+            )
+        return None
+    if (
+        route_record.get("decision_id")
+        != SAM3D_OBSERVATION_SELECTION_DECISION_ID
+    ):
+        raise ValueError(
+            "SAM3D-observation-selection route record has an unexpected "
+            f"decision_id: {route_record.get('decision_id')!r}"
+        )
+    route = route_record.get("route")
+    if route not in SAM3D_OBSERVATION_SELECTION_ROUTES:
+        raise ValueError(
+            f"unsupported SAM3D-observation-selection route: {route!r}"
+        )
+    context = route_record.get("context")
+    if not isinstance(context, dict):
+        raise ValueError(
+            "SAM3D-observation-selection route record is missing its context"
+        )
+    benchmark = str(context.get("benchmark") or "").strip().lower()
+    scenario = str(context.get("scenario") or "").strip().lower() or None
+    if benchmark == "clevrer" and scenario is not None:
+        raise ValueError(
+            "CLEVRER SAM3D observation route must not contain a scenario context"
+        )
+    if benchmark == "physion_pp" and scenario is None:
+        raise ValueError(
+            "Physion++ SAM3D observation route is missing its scenario context"
+        )
+    if benchmark not in {"clevrer", "physion_pp"}:
+        raise ValueError(
+            "SAM3D-observation-selection route has an unsupported benchmark "
+            f"context: {context.get('benchmark')!r}"
+        )
+    return route_record
 
 
+def _static_temporal_composite_enabled(
+    route_record: dict[str, Any] | None,
+) -> bool:
+    if route_record is None:
+        return False
+    route = route_record.get("route")
+    if route == STATIC_TEMPORAL_COMPOSITE_ROUTE:
+        return True
+    if route == SELECTED_OBSERVATION_ROUTE:
+        return False
+    raise ValueError(f"unsupported SAM3D-observation-selection route: {route!r}")
 
 
 def _observation_policy_benchmark(route_record: dict[str, Any] | None) -> str:
@@ -349,6 +496,69 @@ def _observation_policy_benchmark(route_record: dict[str, Any] | None) -> str:
     return str(context.get("benchmark") or "").strip().lower()
 
 
+def _maybe_reselect_keyframes_physion_pp(
+    *,
+    observation_selection_route: dict[str, Any] | None,
+    keyframes: list[dict[str, Any]],
+    masks: Any,
+    metric_depth: np.ndarray,
+    track_labels: dict[str, Any],
+    track_labels_path: Path,
+) -> dict[str, Any]:
+    """Physion++ only: re-pick each object's SAM3D keyframe with occlusion-aware logic and
+    sync the choice back into object_keyframes (so FoundationPose registration uses it too).
+    No-op (and safe) for non-Physion++ routes or on any failure."""
+    if _observation_policy_benchmark(observation_selection_route) != "physion_pp":
+        return {"applied": False, "reason": "not_physion_pp"}
+    try:
+        selection = select_occlusion_aware_keyframes(
+            object_keyframes=keyframes, masks=masks, metric_depth=metric_depth
+        )
+    except Exception as error:  # never break reconstruction over re-selection
+        return {"applied": False, "reason": f"reselection_error: {error}"}
+
+    changed = []
+    for keyframe in keyframes:
+        object_id = str(keyframe.get("object_id"))
+        pick = selection.get(object_id)
+        if not pick or pick.get("mask_key") is None:
+            continue
+        old_frame = keyframe.get("frame_index")
+        new_frame = pick["frame_index"]
+        keyframe["occlusion_aware_reselection"] = {
+            "previous_frame_index": old_frame,
+            "previous_mask_key": keyframe.get("mask_key"),
+            "selection_rule": pick["selection_rule"],
+            "fallback_used": pick["fallback_used"],
+            "selected_role": pick["selected_role"],
+            "eligible_frame_count": pick["eligible_frame_count"],
+            "candidate_frame_count": pick["candidate_frame_count"],
+        }
+        if int(new_frame) != int(old_frame if old_frame is not None else -1):
+            keyframe["frame_index"] = int(new_frame)
+            keyframe["mask_key"] = pick["mask_key"]
+            keyframe["area"] = pick["area"]
+            # Regenerate all frame-dependent derivatives for the selected keyframe.
+            for stale in (
+                "selected_frame_image",
+                "selected_frame_image_fingerprint",
+                "selected_frame_image_format",
+                "representative_image_path",
+                "representative_overlay_path",
+                "bbox_xyxy",
+                "centroid_xy",
+            ):
+                keyframe.pop(stale, None)
+            changed.append((object_id, old_frame, int(new_frame)))
+
+    track_labels["object_keyframe_reselection"] = {
+        "applied": True,
+        "method": "occlusion_aware_depth_front_back_largest_clean_area",
+        "changed": [{"object_id": o, "from": f, "to": t} for o, f, t in changed],
+    }
+    if changed:
+        track_labels_path.write_text(json.dumps(track_labels, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"applied": True, "changed": changed}
 
 
 def run_sam3d_objects(
@@ -377,12 +587,26 @@ def run_sam3d_objects(
     video_metric_depth = _load_json(video_metric_depth_path)
     depth_arrays = np.load(video_metric_depth["tensor_sidecar"])
     metric_depth = depth_arrays["metric_depth"]
+    _maybe_reselect_keyframes_physion_pp(
+        observation_selection_route=observation_selection_route,
+        keyframes=keyframes,
+        masks=masks,
+        metric_depth=metric_depth,
+        track_labels=track_labels,
+        track_labels_path=artifact_path_by_name(question_dir, "sam3_video_track_labels.json"),
+    )
     fixed_k = np.asarray(video_metric_depth.get("fixed_intrinsics"), dtype=np.float32)
     if fixed_k.shape != (3, 3) or not np.isfinite(fixed_k).all():
         raise ValueError(
             "video_metric_depth.json fixed_intrinsics must contain finite 3x3 MoGe-2 K_fixed. "
             "Re-run moge2_intrinsics and video_metric_depth."
         )
+    # The resolved special route rebuilds static-fixture RGB/mask/depth inputs from
+    # mover-free frames; the shared route keeps the selected keyframe observation.
+    # Which scenario receives the special route is defined only in route-policy JSON.
+    composite_static_inputs = _static_temporal_composite_enabled(
+        observation_selection_route
+    )
     video_frames_rgb: np.ndarray | None = None
     mover_valid_stack: np.ndarray | None = None
     mover_track_count = 0
@@ -429,7 +653,22 @@ def run_sam3d_objects(
         composite_info: dict[str, Any] = {}
         composite_depth: np.ndarray | None = None
         if composite_applied:
+            if video_frames_rgb is None:
+                video_frames_rgb = _load_video_frames_rgb(video)
             n_frames = min(len(video_frames_rgb), len(metric_depth))
+            if mover_valid_stack is None:
+                mover_valid_stack, mover_track_count = _mover_free_valid_stack(
+                    masks, n_frames, mask.shape
+                )
+            fixture_stack = _track_mask_stack(masks, track_id, n_frames, mask.shape)
+            image, mask, composite_depth, composite_info = _physion_pp_static_temporal_composite(
+                fixture_stack=fixture_stack,
+                valid_stack=mover_valid_stack,
+                frames_rgb=video_frames_rgb,
+                metric_depth=metric_depth,
+                selected_mask=mask,
+                frame_index=int(frame_index),
+            )
             composite_info["mover_track_count"] = mover_track_count
             image_source = "physion_pp_static_temporal_composite"
             image_fingerprint = _array_fingerprint(image)

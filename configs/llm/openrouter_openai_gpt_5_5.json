@@ -1,0 +1,7 @@
+{
+  "provider": "openrouter",
+  "model": "openai/gpt-5.5",
+  "input_mode": "sampled_frames",
+  "num_frames": 8,
+  "max_output_tokens": 8192
+}

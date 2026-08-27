@@ -15,11 +15,26 @@ from agent.query import (
     extract_answer_tag,
     infer_model_family,
 )
+from agent.world_model.route_policy import (
+    RouteContext,
+    RoutePolicy,
+    RoutePolicyValidationError,
+    load_route_policy,
+)
 from benchmark.clevrer import ClevrerScene, load_validation_scenes
 from benchmark.metrics import (
     compute_metrics,
     compute_physion_pp_metrics,
     normalize_descriptive_answer,
+)
+from benchmark.physion_pp import (
+    PHYSION_PP_BASELINE_SCENARIOS,
+    PHYSION_PP_RUN_CUE_VIDEO_DIRNAME,
+    PHYSION_PP_TRACKING_CUE_INPUT_MODE,
+    PhysionPPScene,
+    load_test_scenes as load_physion_pp_test_scenes,
+    resolve_cue_clip_scenes,
+    stage_cue_clips_into_run_dir,
 )
 from benchmark.prompts import (
     ANSWER_FORMATS,
@@ -35,11 +50,27 @@ CHOICE_LETTER_PATTERN = re.compile(r"[A-Z]")
 PLAIN_ANSWER_PATTERNS = {
     "plain-answer": re.compile(r"(?im)^\s*answer\s*:\s*(.+?)\s*$"),
 }
+PHYSION_PP_TRACKING_CUE_FRAME_INTRO = (
+    "The following {num_frames} images are uniformly sampled frames from the video and "
+    "are shown in chronological order. Use their temporal sequence to infer physical "
+    "properties and reason about the scene over time.\n\n"
+    "In every sampled frame, a semi-transparent RED overlay marks the AGENT object and a "
+    "semi-transparent YELLOW overlay marks the PATIENT object. These overlays follow the "
+    "visible pixels of the same two objects over time. They are target-identification "
+    "annotations only: do not interpret the overlay colors as intrinsic object appearance, "
+    "material, or physical properties, and do not treat overlay changes as physical motion "
+    "or contact."
+)
 DIRECT_ANSWER_INPUT_MODALITY_DECISION_ID = "DA-001.input_modality"
 DIRECT_ANSWER_INPUT_MODALITY_ROUTE = "direct_input.video_or_frames"
+PHYSION_PP_CUE_INPUT_DECISION_ID = "DA-002.physionpp_cue_input"
+PHYSION_PP_CUE_INPUT_ROUTE = "direct_input.cue_annotated"
 DIRECT_ANSWER_PROMPT_FAMILY_DECISION_ID = "DA-003.prompt_family"
 CLEVRER_DIRECT_ANSWER_PROMPT_FAMILY_ROUTE = (
     "prompt.descriptive_or_multiple_choice"
+)
+PHYSION_PP_DIRECT_ANSWER_PROMPT_FAMILY_ROUTE = (
+    "prompt.contact_yes_no"
 )
 DIRECT_ANSWER_PROMPT_FAMILY_ROUTES = frozenset(
     {
@@ -52,22 +83,279 @@ DIRECT_ANSWER_OUTPUT_CONTRACT_ROUTE = (
     "output.standard_run_bundle"
 )
 DIRECT_ANSWER_POLICY_BENCHMARKS = frozenset({"clevrer", "physion_pp"})
+PHYSION_PP_DIRECT_ANSWER_SCENARIOS = frozenset(
+    PHYSION_PP_BASELINE_SCENARIOS
+)
 
 
+def _resolve_direct_answer_input_modality(
+    benchmark: str,
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        DIRECT_ANSWER_INPUT_MODALITY_DECISION_ID,
+        RouteContext(
+            benchmark=benchmark,
+            entrypoint="direct-answer",
+        ),
+    )
+    if resolved_route.get("route") != DIRECT_ANSWER_INPUT_MODALITY_ROUTE:
+        raise RoutePolicyValidationError(
+            "unsupported direct-answer input-modality route: "
+            f"{resolved_route.get('route')!r}"
+        )
+    return resolved_route
 
 
+def _require_direct_answer_input_modality(
+    route_record: dict[str, Any] | None,
+    *,
+    benchmark: str | None,
+) -> dict[str, Any] | None:
+    if benchmark not in DIRECT_ANSWER_POLICY_BENCHMARKS:
+        if route_record is not None:
+            raise RoutePolicyValidationError(
+                "direct-answer input-modality route is not applicable to this benchmark"
+            )
+        return None
+    if route_record is None:
+        raise RoutePolicyValidationError(
+            "missing DA-001 direct-answer input-modality route record"
+        )
+    if (
+        route_record.get("decision_id")
+        != DIRECT_ANSWER_INPUT_MODALITY_DECISION_ID
+    ):
+        raise RoutePolicyValidationError(
+            "direct-answer input-modality route has an unexpected decision_id: "
+            f"{route_record.get('decision_id')!r}"
+        )
+    route = str(route_record.get("route") or "")
+    if route != DIRECT_ANSWER_INPUT_MODALITY_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported direct-answer input-modality route: {route!r}"
+        )
+    record_context = route_record.get("context")
+    if not isinstance(record_context, dict):
+        raise RoutePolicyValidationError(
+            "direct-answer input-modality route is missing context"
+        )
+    expected_context = {
+        "benchmark": benchmark,
+        "entrypoint": "direct-answer",
+    }
+    observed_context = {
+        key: record_context.get(key)
+        for key in expected_context
+    }
+    if observed_context != expected_context:
+        raise RoutePolicyValidationError(
+            "direct-answer input-modality route context mismatch: "
+            f"{observed_context!r} != {expected_context!r}"
+        )
+    return route_record
 
 
+def _resolve_physion_pp_cue_input(
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        PHYSION_PP_CUE_INPUT_DECISION_ID,
+        RouteContext(benchmark="physion_pp"),
+    )
+    if resolved_route.get("route") != PHYSION_PP_CUE_INPUT_ROUTE:
+        raise RoutePolicyValidationError(
+            "unsupported Physion++ cue-input route: "
+            f"{resolved_route.get('route')!r}"
+        )
+    return resolved_route
 
 
+def _require_physion_pp_cue_input(
+    route_record: dict[str, Any] | None,
+    *,
+    benchmark: str | None,
+) -> dict[str, Any] | None:
+    if benchmark != "physion_pp":
+        if route_record is not None:
+            raise RoutePolicyValidationError(
+                "Physion++ cue-input route is not applicable to this benchmark"
+            )
+        return None
+    if route_record is None:
+        raise RoutePolicyValidationError(
+            "missing DA-002 Physion++ cue-input route record"
+        )
+    if route_record.get("decision_id") != PHYSION_PP_CUE_INPUT_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "Physion++ cue-input route has an unexpected decision_id: "
+            f"{route_record.get('decision_id')!r}"
+        )
+    route = str(route_record.get("route") or "")
+    if route != PHYSION_PP_CUE_INPUT_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported Physion++ cue-input route: {route!r}"
+        )
+    record_context = route_record.get("context")
+    if not isinstance(record_context, dict):
+        raise RoutePolicyValidationError(
+            "Physion++ cue-input route is missing context"
+        )
+    if record_context.get("benchmark") != "physion_pp":
+        raise RoutePolicyValidationError(
+            "Physion++ cue-input route context mismatch: "
+            f"{record_context.get('benchmark')!r} != 'physion_pp'"
+        )
+    return route_record
 
 
+def _resolve_direct_answer_prompt_family(
+    benchmark: str,
+    *,
+    scenario: str | None,
+    question_type: str | None,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        DIRECT_ANSWER_PROMPT_FAMILY_DECISION_ID,
+        RouteContext(
+            benchmark=benchmark,
+            scenario=scenario,
+            question_type=question_type,
+        ),
+    )
+    if resolved_route.get("route") not in DIRECT_ANSWER_PROMPT_FAMILY_ROUTES:
+        raise RoutePolicyValidationError(
+            "unsupported direct-answer prompt-family route: "
+            f"{resolved_route.get('route')!r}"
+        )
+    return resolved_route
 
 
+def _require_direct_answer_prompt_family(
+    route_record: dict[str, Any] | None,
+    *,
+    benchmark: str,
+    scenario: str | None,
+    question_type: str | None,
+) -> dict[str, Any] | None:
+    applicable = benchmark == "clevrer" or (
+        benchmark == "physion_pp"
+        and scenario in PHYSION_PP_DIRECT_ANSWER_SCENARIOS
+    )
+    if not applicable:
+        if route_record is not None:
+            raise RoutePolicyValidationError(
+                "direct-answer prompt-family route is not applicable to this benchmark/scenario"
+            )
+        return None
+    if route_record is None:
+        raise RoutePolicyValidationError(
+            "missing DA-003 direct-answer prompt-family route record"
+        )
+    if route_record.get("decision_id") != DIRECT_ANSWER_PROMPT_FAMILY_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "direct-answer prompt-family route has an unexpected decision_id: "
+            f"{route_record.get('decision_id')!r}"
+        )
+    route = str(route_record.get("route") or "")
+    if route not in DIRECT_ANSWER_PROMPT_FAMILY_ROUTES:
+        raise RoutePolicyValidationError(
+            f"unsupported direct-answer prompt-family route: {route!r}"
+        )
+    record_context = route_record.get("context")
+    if not isinstance(record_context, dict):
+        raise RoutePolicyValidationError(
+            "direct-answer prompt-family route is missing context"
+        )
+    expected_context = {
+        "benchmark": benchmark,
+        "scenario": scenario,
+        "question_type": question_type,
+    }
+    observed_context = {
+        key: record_context.get(key)
+        for key in expected_context
+    }
+    if observed_context != expected_context:
+        raise RoutePolicyValidationError(
+            "direct-answer prompt-family route context mismatch: "
+            f"{observed_context!r} != {expected_context!r}"
+        )
+    expected_route = (
+        CLEVRER_DIRECT_ANSWER_PROMPT_FAMILY_ROUTE
+        if benchmark == "clevrer"
+        else PHYSION_PP_DIRECT_ANSWER_PROMPT_FAMILY_ROUTE
+        if scenario in PHYSION_PP_DIRECT_ANSWER_SCENARIOS
+        else None
+    )
+    if route != expected_route:
+        raise RoutePolicyValidationError(
+            "direct-answer prompt-family route does not match benchmark/scenario: "
+            f"{route!r} != {expected_route!r}"
+        )
+    return route_record
 
 
+def _resolve_direct_answer_output_contract(
+    benchmark: str,
+    *,
+    policy: RoutePolicy | None = None,
+) -> dict[str, Any]:
+    active_policy = policy or load_route_policy()
+    resolved_route = active_policy.resolve_record(
+        DIRECT_ANSWER_OUTPUT_CONTRACT_DECISION_ID,
+        RouteContext(benchmark=benchmark),
+    )
+    if resolved_route.get("route") != DIRECT_ANSWER_OUTPUT_CONTRACT_ROUTE:
+        raise RoutePolicyValidationError(
+            "unsupported direct-answer output-contract route: "
+            f"{resolved_route.get('route')!r}"
+        )
+    return resolved_route
 
 
+def _require_direct_answer_output_contract(
+    route_record: dict[str, Any] | None,
+    *,
+    benchmark: str | None,
+) -> dict[str, Any] | None:
+    if benchmark not in DIRECT_ANSWER_POLICY_BENCHMARKS:
+        if route_record is not None:
+            raise RoutePolicyValidationError(
+                "direct-answer output-contract route is not applicable to this benchmark"
+            )
+        return None
+    if route_record is None:
+        raise RoutePolicyValidationError(
+            "missing DA-004 direct-answer output-contract route record"
+        )
+    if route_record.get("decision_id") != DIRECT_ANSWER_OUTPUT_CONTRACT_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "direct-answer output-contract route has an unexpected decision_id: "
+            f"{route_record.get('decision_id')!r}"
+        )
+    route = str(route_record.get("route") or "")
+    if route != DIRECT_ANSWER_OUTPUT_CONTRACT_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported direct-answer output-contract route: {route!r}"
+        )
+    record_context = route_record.get("context")
+    if not isinstance(record_context, dict):
+        raise RoutePolicyValidationError(
+            "direct-answer output-contract route is missing context"
+        )
+    if record_context.get("benchmark") != benchmark:
+        raise RoutePolicyValidationError(
+            "direct-answer output-contract route context mismatch: "
+            f"{record_context.get('benchmark')!r} != {benchmark!r}"
+        )
+    return route_record
 
 
 def _direct_answer_input_materialization(
@@ -85,6 +373,28 @@ def _direct_answer_input_materialization(
     return "full_video"
 
 
+def _physion_pp_input_materialization(
+    config: ModelConfig,
+    scene: PhysionPPScene,
+) -> str:
+    uses_tracking_cues = (
+        scene.cue_input_mode == PHYSION_PP_TRACKING_CUE_INPUT_MODE
+    )
+    return _direct_answer_input_materialization(
+        config,
+        additional_reference_frame_indices=(
+            [scene.cue_reference_frame_index]
+            if not uses_tracking_cues
+            and scene.cue_reference_frame_index is not None
+            and infer_model_family(config.model) == "gpt"
+            else None
+        ),
+        sampled_frame_intro=(
+            PHYSION_PP_TRACKING_CUE_FRAME_INTRO
+            if uses_tracking_cues
+            else None
+        ),
+    )
 
 
 def _direct_answer_desc(bench_name: str) -> str:

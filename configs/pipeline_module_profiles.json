@@ -1,0 +1,598 @@
+{
+  "schema_version": 2,
+  "profile_set_id": "physmind_route_modules_v2",
+  "shared_modules": {
+    "artifact_identity": {
+      "implementation": "physionpp_tracking_artifact_contract",
+      "parameters": {
+        "concept_id": "physion_pp_gdino_visual_prompt",
+        "cue_trimmed_suffix": "_cue_trimmed.mp4",
+        "cue_flash_suffix": "_cue_flash.npz",
+        "static_track_prefix": "physion_pp_static_"
+      }
+    },
+    "gdino_cleanup": {
+      "implementation": "area_edge_filter_then_same_label_nms",
+      "parameters": {
+        "confidence": 0.25,
+        "area_cap_fraction": 0.6,
+        "same_label_nms_iou": 0.5,
+        "edge_margin_px": 2,
+        "edge_sides_to_drop": 3
+      }
+    },
+    "sam3_mask_filter": {
+      "implementation": "anchor_probe_area_and_iou_filter",
+      "parameters": {
+        "f0_dedup_iou": 0.75,
+        "minimum_area_px": 20
+      }
+    },
+    "same_object_merge": {
+      "implementation": "overlap_relay_comotion_evidence",
+      "parameters": {
+        "overlap_min_shared_frames": 5,
+        "overlap_iou": 0.75,
+        "relay_coexist_fraction": 0.3,
+        "relay_gap_frames": 5,
+        "relay_centroid_px": 12.0,
+        "comotion_min_shared_frames": 10,
+        "comotion_min_displacement_px": 25.0,
+        "comotion_dilate_px": 5,
+        "comotion_contact_fraction": 0.6,
+        "comotion_distance_std_px": 3.0,
+        "default_evidence": ["overlap", "relay", "comotion"]
+      }
+    },
+    "cue_role_binding": {
+      "implementation": "cue_flash_track_coverage_with_motion_tie_break",
+      "parameters": {
+        "minimum_coverage": 0.3,
+        "tie_margin": 0.2
+      }
+    },
+    "static_role_assignment": {
+      "implementation": "mask_centroid_net_displacement",
+      "parameters": {
+        "maximum_displacement_px": 10.0
+      }
+    },
+    "sam3_priority": {
+      "implementation": "separate_sessions_then_pixel_priority_carve",
+      "parameters": {
+        "solo_red_class_keyword": "red"
+      }
+    }
+  },
+  "route_profiles": {
+    "tracking.gdino_role_box_point": {
+      "decision_id": "TRK-001.tracking_family",
+      "route": "tracking.gdino_role_box_point",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_platform_pp"],
+      "modules": {
+        "detector": {
+          "implementation": "gdino_role_specific_multi_round",
+          "parameters": {
+            "rounds": [
+              {"name": "red", "query": "red object", "confidence": 0.4, "prompt_mode": "box", "session": "solo"},
+              {"name": "yellow", "query": "small yellow patch", "confidence": 0.4, "prompt_mode": "point", "session": "solo"},
+              {"name": "house", "query": "large house-shaped block", "confidence": 0.55, "prompt_mode": "box", "session": "structure"},
+              {"name": "long_ramp", "query": "large wedge ramp", "confidence": 0.65, "prompt_mode": "box", "session": "structure"},
+              {"name": "small_wedge", "query": "small wedge ramp", "confidence": 0.2, "prompt_mode": "box", "session": "structure"}
+            ],
+            "cross_round_merge_iou": 0.7,
+            "cross_round_merge_containment": 0.85
+          }
+        },
+        "sam3_seed": {
+          "implementation": "solo_red_box_solo_yellow_point_joint_structure_boxes",
+          "parameters": {
+            "anchor_source": "cli_prompt_frame_index",
+            "pixel_priority": ["red", "yellow", "structure"]
+          }
+        },
+        "postprocess": {
+          "implementation": "priority_carve_fragment_cleanup_structure_merge",
+          "parameters": {
+            "fragment_minimum_area_px": 20,
+            "fragment_minimum_largest_fraction": 0.005,
+            "same_object_merge_evidence": ["overlap", "relay"]
+          }
+        },
+        "role_binding": {
+          "implementation": "cue_flash_red_agent_yellow_patient",
+          "parameters": {}
+        }
+      }
+    },
+    "tracking.gdino_per_part_seeds": {
+      "decision_id": "TRK-001.tracking_family",
+      "route": "tracking.gdino_per_part_seeds",
+      "benchmark": "physion_pp",
+      "scenarios": ["bouncy_platform_pp"],
+      "modules": {
+        "detector": {
+          "implementation": "gdino_per_part_targeted_rounds",
+          "parameters": {
+            "vocabulary": ["small dark red block", "large dark wooden platform", "wooden frame", "yellow mat", "green mat", "teal mat", "mat"],
+            "agent_query": "small red block",
+            "agent_confidence": 0.15,
+            "agent_max_side_px": 32,
+            "big_block_query": "large dark box",
+            "big_block_confidence": 0.15,
+            "static_drop_words": ["red", "yellow"],
+            "reference_containment": 0.8
+          }
+        },
+        "sam3_seed": {
+          "implementation": "agent_point_other_parts_box_both_direction",
+          "parameters": {
+            "anchor_frame": 60,
+            "agent_fallback_frames": [50, 70, 40, 80, 30],
+            "mask_containment": 0.8,
+            "pixel_priority": ["agent", "yellow", "other"]
+          }
+        },
+        "postprocess": {
+          "implementation": "anchor_probe_keep_big_containment",
+          "parameters": {}
+        },
+        "role_binding": {
+          "implementation": "cue_flash_red_agent_yellow_patient",
+          "parameters": {}
+        }
+      }
+    },
+    "tracking.gdino_two_segment_point_probe": {
+      "decision_id": "TRK-001.tracking_family",
+      "route": "tracking.gdino_two_segment_point_probe",
+      "benchmark": "physion_pp",
+      "scenarios": ["bouncy_wall_pp"],
+      "modules": {
+        "detector": {
+          "implementation": "gdino_mixed_vocabulary_point_prompts",
+          "parameters": {
+            "vocabulary": ["small dark block in the air", "small dark object", "large wooden panel", "mat", "colored mat"]
+          }
+        },
+        "temporal_partition": {
+          "implementation": "two_background_curtain_column_walk",
+          "parameters": {
+            "rgb_difference_threshold": 25,
+            "core_minimum_difference_fraction": 0.2,
+            "column_band_top": 176,
+            "column_occupancy": 0.35,
+            "column_adjacency": 8,
+            "stall_frames": 10,
+            "background_1_frames": 45,
+            "background_2_frames": 11
+          }
+        },
+        "sam3_seed": {
+          "implementation": "per_segment_point_probe_and_propagate",
+          "parameters": {
+            "solo_class_words": ["block", "object"]
+          }
+        },
+        "postprocess": {
+          "implementation": "cross_segment_window_filter_and_identity_merge",
+          "parameters": {
+            "window_cross_static": 0.2,
+            "window_max_area_px": 3000
+          }
+        },
+        "role_binding": {
+          "implementation": "cue_flash_then_vlm_agent_identity_and_position",
+          "parameters": {
+            "wall_position_iou": 0.3,
+            "static_pair_iou": 0.6
+          }
+        }
+      }
+    },
+    "tracking.gdino_two_segment_boxes": {
+      "decision_id": "TRK-001.tracking_family",
+      "route": "tracking.gdino_two_segment_boxes",
+      "benchmark": "physion_pp",
+      "scenarios": ["mass_collision_pp"],
+      "modules": {
+        "detector": {
+          "implementation": "gdino_multi_query_role_boxes",
+          "parameters": {
+            "ball_query": "basketball",
+            "agent_query": "large object",
+            "patient_query": "purple cube . blue cube . green cube . yellow cube . pink cube",
+            "window_query": "white window",
+            "confidence": 0.1,
+            "top_k": 8,
+            "score_band": 0.6,
+            "merge_gap_px": 2,
+            "merge_color_distance": 15,
+            "containment": 0.7,
+            "same_object": 0.6,
+            "agent_suppression": 0.5,
+            "window_saturation_maximum": 20,
+            "window_value_minimum": 170
+          }
+        },
+        "temporal_partition": {
+          "implementation": "curtain_full_frame_coverage_with_edge_padding",
+          "parameters": {
+            "rgb_difference_threshold": 25,
+            "core_minimum_difference_fraction": 0.2,
+            "background_1_frames": 45,
+            "background_2_frames": 11,
+            "edge_margin_frames": 5
+          }
+        },
+        "sam3_seed": {
+          "implementation": "ball_point_agent_patient_box_solo_tracks",
+          "parameters": {
+            "anchor_offsets": [12, 6, 2],
+            "anchor_patient_minimum_score": 0.25
+          }
+        },
+        "postprocess": {
+          "implementation": "ball_priority_window_depth_and_role_cleanup",
+          "parameters": {
+            "moge_model": "Ruicheng/moge-2-vitl-normal",
+            "depth_rank_threshold": 0.65,
+            "edge_touch_margin_px": 2
+          }
+        },
+        "role_binding": {
+          "implementation": "cue_flash_agent_patient_and_gdino_ball",
+          "parameters": {}
+        }
+      }
+    },
+    "mesh_conditioning.aabb_no_guard": {
+      "decision_id": "GEO-004.mesh_conditioning",
+      "route": "mesh_conditioning.aabb_no_guard",
+      "benchmark": "clevrer",
+      "scenarios": [],
+      "modules": {
+        "mesh_conditioning": {
+          "implementation": "project_scale_align_conditioned_mesh",
+          "parameters": {
+            "box_fit": "aabb",
+            "alignment_safety": "disabled"
+          }
+        }
+      }
+    },
+    "mesh_conditioning.obb_warn": {
+      "decision_id": "GEO-004.mesh_conditioning",
+      "route": "mesh_conditioning.obb_warn",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_platform_pp", "bouncy_platform_pp", "friction_collision_pp", "mass_collision_pp"],
+      "modules": {
+        "mesh_conditioning": {
+          "implementation": "project_scale_align_conditioned_mesh",
+          "parameters": {
+            "box_fit": "obb",
+            "alignment_safety": "warn_only"
+          }
+        }
+      }
+    },
+    "mesh_conditioning.obb_rollback": {
+      "decision_id": "GEO-004.mesh_conditioning",
+      "route": "mesh_conditioning.obb_rollback",
+      "benchmark": "physion_pp",
+      "scenarios": ["bouncy_wall_pp"],
+      "modules": {
+        "mesh_conditioning": {
+          "implementation": "project_scale_align_conditioned_mesh",
+          "parameters": {
+            "box_fit": "obb",
+            "alignment_safety": "rollback"
+          }
+        }
+      }
+    },
+    "gravity.overlap_aabb_post_snap": {
+      "decision_id": "POS-003.gravity_estimator",
+      "route": "gravity.overlap_aabb_post_snap",
+      "benchmark": "clevrer",
+      "scenarios": [],
+      "modules": {
+        "overlap_gravity": {
+          "implementation": "sam3_projection_overlap_plane_normal_optimization",
+          "parameters": {
+            "pre_snap_scoring": false,
+            "proxy": "aabb",
+            "static_render_reuse": false,
+            "pp_fine_refinement": false,
+            "pp_base_alignment": false,
+            "winner_post_snap": false
+          }
+        }
+      }
+    },
+    "gravity.overlap_obb_pre_snap": {
+      "decision_id": "POS-003.gravity_estimator",
+      "route": "gravity.overlap_obb_pre_snap",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_platform_pp", "bouncy_wall_pp", "bouncy_platform_pp"],
+      "modules": {
+        "overlap_gravity": {
+          "implementation": "sam3_projection_overlap_plane_normal_optimization",
+          "parameters": {
+            "pre_snap_scoring": true,
+            "proxy": "obb",
+            "static_render_reuse": true,
+            "pp_fine_refinement": true,
+            "pp_base_alignment": true,
+            "winner_post_snap": true
+          }
+        }
+      }
+    },
+    "support.ray_slide_ground": {
+      "decision_id": "POS-006.support_snap",
+      "route": "support.ray_slide_ground",
+      "benchmark": "clevrer",
+      "scenarios": [],
+      "modules": {
+        "support_snap": {
+          "implementation": "mesh_centroid_ray_slide_to_support_plane",
+          "parameters": {
+            "similarity_snap_static_fixtures": false,
+            "robust_static_base_percentile": false,
+            "exclude_sphere_agents": false,
+            "honor_airborne_exemptions": false
+          }
+        }
+      }
+    },
+    "support.platform_sphere_agent": {
+      "decision_id": "POS-006.support_snap",
+      "route": "support.platform_sphere_agent",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_platform_pp"],
+      "modules": {
+        "support_snap": {
+          "implementation": "mesh_centroid_ray_slide_to_support_plane",
+          "parameters": {
+            "similarity_snap_static_fixtures": true,
+            "robust_static_base_percentile": true,
+            "exclude_sphere_agents": true,
+            "honor_airborne_exemptions": true
+          }
+        }
+      }
+    },
+    "support.wall_sphere_agent": {
+      "decision_id": "POS-006.support_snap",
+      "route": "support.wall_sphere_agent",
+      "benchmark": "physion_pp",
+      "scenarios": ["bouncy_wall_pp"],
+      "modules": {
+        "support_snap": {
+          "implementation": "mesh_centroid_ray_slide_to_support_plane",
+          "parameters": {
+            "similarity_snap_static_fixtures": true,
+            "robust_static_base_percentile": true,
+            "exclude_sphere_agents": true,
+            "honor_airborne_exemptions": true
+          }
+        }
+      }
+    },
+    "support.agent_exempt": {
+      "decision_id": "POS-006.support_snap",
+      "route": "support.agent_exempt",
+      "benchmark": "physion_pp",
+      "scenarios": ["bouncy_platform_pp"],
+      "modules": {
+        "support_snap": {
+          "implementation": "mesh_centroid_ray_slide_to_support_plane",
+          "parameters": {
+            "similarity_snap_static_fixtures": true,
+            "robust_static_base_percentile": true,
+            "exclude_sphere_agents": false,
+            "honor_airborne_exemptions": true
+          }
+        }
+      }
+    },
+    "support.moving_patient_exempt": {
+      "decision_id": "POS-006.support_snap",
+      "route": "support.moving_patient_exempt",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_collision_pp"],
+      "modules": {
+        "support_snap": {
+          "implementation": "mesh_centroid_ray_slide_to_support_plane",
+          "parameters": {
+            "similarity_snap_static_fixtures": true,
+            "robust_static_base_percentile": true,
+            "exclude_sphere_agents": false,
+            "honor_airborne_exemptions": true
+          }
+        }
+      }
+    },
+    "support.patient_exempt": {
+      "decision_id": "POS-006.support_snap",
+      "route": "support.patient_exempt",
+      "benchmark": "physion_pp",
+      "scenarios": ["mass_collision_pp"],
+      "modules": {
+        "support_snap": {
+          "implementation": "mesh_centroid_ray_slide_to_support_plane",
+          "parameters": {
+            "similarity_snap_static_fixtures": true,
+            "robust_static_base_percentile": true,
+            "exclude_sphere_agents": false,
+            "honor_airborne_exemptions": true
+          }
+        }
+      }
+    },
+    "flush.static_fixture": {
+      "decision_id": "POS-007.static_fixture_flush",
+      "route": "flush.static_fixture",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_platform_pp", "bouncy_wall_pp", "bouncy_platform_pp"],
+      "modules": {
+        "static_fixture_flush": {
+          "implementation": "static_ground_fixture_coordinate_descent",
+          "parameters": {}
+        }
+      }
+    },
+    "flush.segment1_patient": {
+      "decision_id": "POS-007.static_fixture_flush",
+      "route": "flush.segment1_patient",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_collision_pp"],
+      "modules": {
+        "static_fixture_flush": {
+          "implementation": "segment1_patient_axis_flush_and_mesh_handoff",
+          "parameters": {}
+        }
+      }
+    },
+    "flush.linked_extra": {
+      "decision_id": "POS-007.static_fixture_flush",
+      "route": "flush.linked_extra",
+      "benchmark": "physion_pp",
+      "scenarios": ["mass_collision_pp"],
+      "modules": {
+        "static_fixture_flush": {
+          "implementation": "kept_extra_coordinate_descent_and_linked_mesh_handoff",
+          "parameters": {}
+        }
+      }
+    },
+    "trajectory.platform_sphere": {
+      "decision_id": "POS-009.friction_platform_agent_trajectory",
+      "route": "trajectory.platform_sphere",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_platform_pp"],
+      "modules": {
+        "agent_trajectory": {
+          "implementation": "support_surface_mask_sphere_trajectory",
+          "parameters": {}
+        }
+      }
+    },
+    "trajectory.native_ray": {
+      "decision_id": "POS-009.friction_platform_agent_trajectory",
+      "route": "trajectory.native_ray",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_platform_pp"],
+      "modules": {
+        "agent_trajectory": {
+          "implementation": "support_surface_native_mesh_ray_trajectory",
+          "parameters": {}
+        }
+      }
+    },
+    "trajectory.bounce_mask": {
+      "decision_id": "POS-010.bouncy_platform_agent_trajectory",
+      "route": "trajectory.bounce_mask",
+      "benchmark": "physion_pp",
+      "scenarios": ["bouncy_platform_pp"],
+      "modules": {
+        "agent_trajectory": {
+          "implementation": "line_vertical_plane_mask_sphere_trajectory",
+          "parameters": {}
+        }
+      }
+    },
+    "trajectory.wall_mixed_geometry": {
+      "decision_id": "POS-011.bouncy_wall_agent_trajectory",
+      "route": "trajectory.wall_mixed_geometry",
+      "benchmark": "physion_pp",
+      "scenarios": ["bouncy_wall_pp"],
+      "modules": {
+        "agent_trajectory": {
+          "implementation": "wall_plane_sphere_agents_native_non_agents",
+          "parameters": {}
+        }
+      }
+    },
+    "trajectory.wall_native": {
+      "decision_id": "POS-011.bouncy_wall_agent_trajectory",
+      "route": "trajectory.wall_native",
+      "benchmark": "physion_pp",
+      "scenarios": ["bouncy_wall_pp"],
+      "modules": {
+        "agent_trajectory": {
+          "implementation": "wall_plane_native_mesh_fp_rotation",
+          "parameters": {}
+        }
+      }
+    },
+    "motion.mask_centroid_5px": {
+      "decision_id": "POS-012.collision_patient_motion_gate",
+      "route": "motion.mask_centroid_5px",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_collision_pp", "mass_collision_pp"],
+      "modules": {
+        "patient_motion_gate": {
+          "implementation": "segment_edge_mask_centroid_displacement",
+          "parameters": {
+            "edge_frames": 3,
+            "minimum_displacement_px": 5.0
+          }
+        }
+      }
+    },
+    "trajectory.patient_vertical_drop": {
+      "decision_id": "POS-013.collision_patient_drop",
+      "route": "trajectory.patient_vertical_drop",
+      "benchmark": "physion_pp",
+      "scenarios": ["friction_collision_pp", "mass_collision_pp"],
+      "modules": {
+        "patient_drop": {
+          "implementation": "scenario_selected_vertical_drop",
+          "parameters": {
+            "friction_collision_pp": "mask_anchor_vertical_height_search",
+            "mass_collision_pp": "ball_agent_plane_vertical_raycast"
+          }
+        }
+      }
+    },
+    "mesh_adopt.linked_extra_to_patient": {
+      "decision_id": "POS-014.mass_extra_flush_and_mesh_adopt",
+      "route": "mesh_adopt.linked_extra_to_patient",
+      "benchmark": "physion_pp",
+      "scenarios": ["mass_collision_pp"],
+      "modules": {
+        "mesh_adoption": {
+          "implementation": "adopt_linked_extra_final_mesh_for_patient",
+          "parameters": {}
+        }
+      }
+    },
+    "flush.mass_agent": {
+      "decision_id": "POS-015.mass_agent_flush",
+      "route": "flush.mass_agent",
+      "benchmark": "physion_pp",
+      "scenarios": ["mass_collision_pp"],
+      "modules": {
+        "agent_flush": {
+          "implementation": "precontact_static_then_per_frame_ground_translation",
+          "parameters": {}
+        }
+      }
+    },
+    "trajectory.ball_precontact_mask_line": {
+      "decision_id": "POS-016.mass_ball_precontact_trajectory",
+      "route": "trajectory.ball_precontact_mask_line",
+      "benchmark": "physion_pp",
+      "scenarios": ["mass_collision_pp"],
+      "modules": {
+        "ball_trajectory": {
+          "implementation": "joint_segment_mask_line_scale_then_postcontact_cut",
+          "parameters": {}
+        }
+      }
+    }
+  }
+}

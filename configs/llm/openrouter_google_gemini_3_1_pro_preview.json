@@ -1,0 +1,12 @@
+{
+  "provider": "openrouter",
+  "model": "google/gemini-3.1-pro-preview",
+  "input_mode": "full_video",
+  "max_output_tokens": 8092,
+  "openrouter": {
+    "reasoning": {
+      "effort": "medium",
+      "exclude": true
+    }
+  }
+}

@@ -1193,6 +1193,77 @@ def run_physionpp_mass_collision_sphere_sysid(
     return payload
 
 
+def _render_debug_video(result: dict[str, Any], output_path: Path) -> None:
+    import cv2
+
+    segments = [item for item in result.get("segments", []) if item.get("status") == "ok"]
+    if not segments:
+        raise ValueError("mass_collision result has no valid segment to render")
+    all_points: list[np.ndarray] = []
+    for segment in segments:
+        for group in (segment["target_trajectories"], segment["physics_rollout"]["simulated_trajectories"]):
+            for records in group.values():
+                all_points.extend(np.asarray(record["position_blender_world_m"], dtype=np.float64) for record in records)
+    points = np.asarray(all_points, dtype=np.float64)
+    axes = np.argsort(np.var(points, axis=0))[-2:]
+    minimum = np.min(points[:, axes], axis=0)
+    maximum = np.max(points[:, axes], axis=0)
+    center = 0.5 * (minimum + maximum)
+    extent = max(float(np.max(maximum - minimum)) * 1.2, 1e-3)
+    width, height = 960, 540
+    scale = 0.82 * min(width, height) / extent
+
+    def pixel(position: list[float]) -> tuple[int, int]:
+        values = np.asarray(position, dtype=np.float64)[axes]
+        return (
+            int(round(width * 0.5 + (values[0] - center[0]) * scale)),
+            int(round(height * 0.5 - (values[1] - center[1]) * scale)),
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), 25.0, (width, height))
+    colors = [(50, 170, 255), (60, 70, 230), (80, 210, 80)]
+    for segment in segments:
+        targets = segment["target_trajectories"]
+        simulated = segment["physics_rollout"]["simulated_trajectories"]
+        object_ids = [segment["ball_object_id"], segment["agent_object_id"]]
+        if segment.get("patient_object_id"):
+            object_ids.append(segment["patient_object_id"])
+        frame_maps = {
+            object_id: {
+                int(record["frame_index"]): record for record in records
+            }
+            for object_id, records in simulated.items()
+        }
+        target_maps = {
+            object_id: {
+                int(record["frame_index"]): record for record in records
+            }
+            for object_id, records in targets.items()
+        }
+        frame_indices = sorted({frame for mapping in frame_maps.values() for frame in mapping})
+        for frame_index in frame_indices:
+            image = np.full((height, width, 3), 245, dtype=np.uint8)
+            for role_index, object_id in enumerate(object_ids):
+                color = colors[role_index]
+                target_record = target_maps.get(object_id, {}).get(frame_index)
+                simulated_record = frame_maps.get(object_id, {}).get(frame_index)
+                if target_record:
+                    cv2.circle(image, pixel(target_record["position_blender_world_m"]), 10, color, 2, cv2.LINE_AA)
+                if simulated_record:
+                    cv2.circle(image, pixel(simulated_record["position_blender_world_m"]), 6, color, -1, cv2.LINE_AA)
+            cv2.putText(
+                image,
+                f"{segment['segment']} frame {frame_index} | outline=target filled=analytic rollout",
+                (20, 32),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (25, 25, 25),
+                1,
+                cv2.LINE_AA,
+            )
+            writer.write(image)
+    writer.release()
 
 
 def _run_learning_rate_trial(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1257,6 +1328,8 @@ def main() -> None:
         "trials": sorted(trials, key=lambda item: float(item["lr"])),
     }
     _write_json(output_path, result)
+    if args.render_video:
+        _render_debug_video(result, output_dir / "debug" / "target_vs_rollout.mp4")
     print(
         json.dumps(
             {

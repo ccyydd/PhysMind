@@ -79,6 +79,10 @@ def _impulse_stage_name(mode: str) -> str:
     raise ValueError(f"unsupported impulse stage mode: {mode}")
 
 
+def _render_video_enabled(render_video: bool | None) -> bool:
+    if render_video is not None:
+        return bool(render_video)
+    return os.getenv(DEBUG_ARTIFACTS_ENV) == "1"
 
 
 def _unit_np(vector: np.ndarray) -> np.ndarray:
@@ -1404,6 +1408,94 @@ def _draw_video_panel(
         )
 
 
+def _render_comparison_video(
+    output_mp4: Path,
+    *,
+    object_ids: list[str],
+    frames: list[int],
+    target: np.ndarray,
+    predicted: np.ndarray,
+    mask: np.ndarray,
+    target_mask: np.ndarray | None = None,
+    predicted_mask: np.ndarray | None = None,
+    contact_radii: np.ndarray,
+    source_fps: float,
+    width: int = 1280,
+    height: int = 720,
+    fps_override: float | None = None,
+    target_title: str = "GT",
+    predicted_title: str = "Recovered",
+) -> None:
+    import cv2
+
+    output_mp4.parent.mkdir(parents=True, exist_ok=True)
+    video_fps = float(fps_override) if fps_override is not None else max(1.0, min(float(source_fps), 25.0))
+    panel_width = int(width) // 2
+    display_target = _display_xy(target)
+    display_predicted = _display_xy(predicted)
+    target_panel_mask = np.asarray(target_mask if target_mask is not None else mask, dtype=np.float64)
+    predicted_panel_mask = np.asarray(predicted_mask if predicted_mask is not None else mask, dtype=np.float64)
+    active_target = np.asarray(target_panel_mask[..., 0] > 0.0, dtype=bool)
+    active_predicted = np.asarray(predicted_panel_mask[..., 0] > 0.0, dtype=bool)
+    all_points = np.concatenate([display_target[active_target], display_predicted[active_predicted]], axis=0)
+    if all_points.size == 0:
+        raise ValueError("no active points to render")
+    margin = 52
+    min_xy = np.min(all_points, axis=0)
+    max_xy = np.max(all_points, axis=0)
+    span = np.maximum(max_xy - min_xy, 1e-6)
+    scale = min((panel_width - 2 * margin) / span[0], (height - 2 * margin) / span[1])
+    center = 0.5 * (min_xy + max_xy)
+    view_span = np.asarray([(panel_width - 2 * margin) / scale, (height - 2 * margin) / scale], dtype=np.float64)
+    transform_min = center - 0.5 * view_span
+    transform_min[1] -= margin / scale
+    writer = cv2.VideoWriter(
+        str(output_mp4),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        video_fps,
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"failed to open video writer: {output_mp4}")
+    colors = _video_colors(len(object_ids))
+    try:
+        for frame_offset, frame_index in enumerate(frames):
+            canvas = np.full((int(height), int(width), 3), 255, dtype=np.uint8)
+            label = f"frame {int(frame_index)}"
+            _draw_video_panel(
+                canvas,
+                origin_x=0,
+                width=panel_width,
+                height=int(height),
+                title=target_title,
+                frame_label=label,
+                object_ids=object_ids,
+                positions=target[frame_offset],
+                mask_row=target_panel_mask[frame_offset],
+                transform_scale=scale,
+                transform_min=transform_min,
+                colors=colors,
+                contact_radii=contact_radii,
+            )
+            _draw_video_panel(
+                canvas,
+                origin_x=panel_width,
+                width=int(width) - panel_width,
+                height=int(height),
+                title=predicted_title,
+                frame_label=label,
+                object_ids=object_ids,
+                positions=predicted[frame_offset],
+                mask_row=predicted_panel_mask[frame_offset],
+                transform_scale=scale,
+                transform_min=transform_min,
+                colors=colors,
+                contact_radii=contact_radii,
+            )
+            cv2.line(canvas, (panel_width, 0), (panel_width, int(height)), (190, 190, 190), 2, cv2.LINE_AA)
+            writer.write(canvas)
+    finally:
+        writer.release()
 
 
 def _rmse_summary(
@@ -2043,6 +2135,17 @@ def _run_impulse_stage(
         mask.detach().cpu().numpy(),
     )
     stage_video_path = stage_plot_path.with_suffix(".mp4") if render_video_flag else None
+    if stage_video_path is not None:
+        _render_comparison_video(
+            stage_video_path,
+            object_ids=object_ids,
+            frames=frames,
+            target=target.detach().cpu().numpy(),
+            predicted=optimization_predicted.detach().cpu().numpy(),
+            mask=mask.detach().cpu().numpy(),
+            contact_radii=contact_radii.detach().cpu().numpy(),
+            source_fps=fps,
+        )
     free_rollout_plot_path = output_dir / f"{stage_name}_free_rollout.png"
     _plot(
         free_rollout_plot_path,
@@ -2052,6 +2155,17 @@ def _run_impulse_stage(
         mask.detach().cpu().numpy(),
     )
     free_rollout_video_path = free_rollout_plot_path.with_suffix(".mp4") if render_video_flag else None
+    if free_rollout_video_path is not None:
+        _render_comparison_video(
+            free_rollout_video_path,
+            object_ids=object_ids,
+            frames=frames,
+            target=target.detach().cpu().numpy(),
+            predicted=free_predicted.detach().cpu().numpy(),
+            mask=mask.detach().cpu().numpy(),
+            contact_radii=contact_radii.detach().cpu().numpy(),
+            source_fps=fps,
+        )
     payload = {
         "input_fit": str(input_fit),
         "steps": int(steps),
@@ -4809,6 +4923,17 @@ def run(
             mask.detach().cpu().numpy(),
         )
     video_path = plot_path.with_suffix(".mp4") if plot_path is not None else None
+    if video_path is not None:
+        _render_comparison_video(
+            video_path,
+            object_ids=object_ids,
+            frames=frames,
+            target=target.detach().cpu().numpy(),
+            predicted=predicted.detach().cpu().numpy(),
+            mask=mask.detach().cpu().numpy(),
+            contact_radii=contact_radii.detach().cpu().numpy(),
+            source_fps=fps,
+        )
     if event_source == EVENT_SOURCE_FREE_ROLLOUT:
         free_rollout_plot_path = plot_path
         free_rollout_video_path = video_path
@@ -4823,6 +4948,17 @@ def run(
                 mask.detach().cpu().numpy(),
             )
         free_rollout_video_path = free_rollout_plot_path.with_suffix(".mp4") if free_rollout_plot_path is not None else None
+        if free_rollout_video_path is not None:
+            _render_comparison_video(
+                free_rollout_video_path,
+                object_ids=object_ids,
+                frames=frames,
+                target=target.detach().cpu().numpy(),
+                predicted=free_rollout_predicted.detach().cpu().numpy(),
+                mask=mask.detach().cpu().numpy(),
+                contact_radii=contact_radii.detach().cpu().numpy(),
+                source_fps=fps,
+            )
     model_events = []
     for record in event_records:
         event_index = int(record["event_index"].detach().cpu())
@@ -5248,8 +5384,82 @@ def _rollout_from_analytic_result(
     )
 
 
+def render_comparison_video_from_result_json(
+    *,
+    input_fit: Path,
+    result_json: Path,
+    output_mp4: Path,
+    width: int = 1280,
+    height: int = 720,
+    fps_override: float | None = None,
+) -> None:
+    fit = _load_json(input_fit)
+    result = _load_json(result_json)
+    object_ids, frames, target, predicted, mask, contact_radii, source_fps = _rollout_from_analytic_result(fit, result)
+    _render_comparison_video(
+        output_mp4,
+        object_ids=object_ids,
+        frames=frames,
+        target=target,
+        predicted=predicted,
+        mask=mask,
+        contact_radii=contact_radii,
+        source_fps=source_fps,
+        width=width,
+        height=height,
+        fps_override=fps_override,
+    )
 
 
+def render_analytic_result_debug_artifacts(
+    *,
+    input_fit: Path,
+    result_json: Path,
+    output_dir: Path | None = None,
+    width: int = 1280,
+    height: int = 720,
+    fps_override: float | None = None,
+) -> dict[str, Any]:
+    fit = _load_json(input_fit)
+    result = _load_json(result_json)
+    object_ids, frames, target, predicted, mask, contact_radii, source_fps = _rollout_from_analytic_result(fit, result)
+    render_dir = output_dir if output_dir is not None else result_json.parent
+    render_dir.mkdir(parents=True, exist_ok=True)
+    stage_name = str(result.get("stage_name") or "analytic_free_rollout")
+    plot_path = render_dir / f"{stage_name}.png"
+    video_path = plot_path.with_suffix(".mp4")
+    _plot(plot_path, object_ids, target, predicted, mask)
+    _render_comparison_video(
+        video_path,
+        object_ids=object_ids,
+        frames=frames,
+        target=target,
+        predicted=predicted,
+        mask=mask,
+        contact_radii=contact_radii,
+        source_fps=source_fps,
+        width=width,
+        height=height,
+        fps_override=fps_override,
+        predicted_title="Free rollout",
+    )
+    result["render_video"] = True
+    result["stage_plot_path"] = str(plot_path)
+    result["stage_video_path"] = str(video_path)
+    result["plot_path"] = str(plot_path)
+    result["video_path"] = str(video_path)
+    result["free_rollout_plot_path"] = str(plot_path)
+    result["free_rollout_video_path"] = str(video_path)
+    result_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "status": "ok",
+        "input_fit": str(input_fit),
+        "result_json": str(result_json),
+        "plot_path": str(plot_path),
+        "video_path": str(video_path),
+        "frame_count": len(frames),
+        "object_ids": object_ids,
+    }
 
 
 def _json_clone(payload: dict[str, Any]) -> dict[str, Any]:
@@ -5741,6 +5951,11 @@ def run_swr_manifest_pipeline_multistart(
     input_fit_path = output_dir / "analytic_input_fit.json"
     analytic_result_path = output_dir / "analytic_free_rollout" / "result.json"
     render_result = None
+    if _render_video_enabled(render_video):
+        render_result = render_analytic_result_debug_artifacts(
+            input_fit=input_fit_path,
+            result_json=analytic_result_path,
+        )
 
     input_fit = _load_json(input_fit_path)
     final_summary = _rewrite_json_paths(_load_json(output_dir / "summary.json"), replacements)

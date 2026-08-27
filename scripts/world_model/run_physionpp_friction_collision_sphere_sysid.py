@@ -738,6 +738,102 @@ def run_physionpp_friction_collision_sphere_sysid(
     return payload
 
 
+def _render_debug_video(result: dict[str, Any], output_path: Path) -> None:
+    import cv2
+
+    segments = [item for item in result.get("segments", []) if isinstance(item, dict) and item.get("status") == "ok"]
+    if not segments:
+        return
+    support = result["support_plane"]
+    up = np.asarray(support["up_direction_blender_world"], dtype=np.float64)
+    axis_u = np.asarray(support["tangent_1_blender_world"], dtype=np.float64)
+    axis_v = np.asarray(support["tangent_2_blender_world"], dtype=np.float64)
+    all_positions = []
+    for item in segments:
+        for source in (item["target_trajectories"], item["physics_rollout"]["simulated_trajectories"]):
+            for records in source.values():
+                all_positions.extend(np.asarray([record["position_blender_world_m"] for record in records], dtype=np.float64))
+    points = np.asarray(all_positions, dtype=np.float64).reshape(-1, 3)
+    top = np.stack([points @ axis_u, points @ axis_v], axis=1)
+    side = np.stack([points @ axis_u, points @ up], axis=1)
+
+    width, height = 1120, 520
+    panel_width = width // 2
+    margin = 55
+
+    def transform(values: np.ndarray, panel_index: int):
+        lower = np.min(values, axis=0)
+        upper = np.max(values, axis=0)
+        center = 0.5 * (lower + upper)
+        span = max(float(np.max(upper - lower)) * 1.2, 0.5)
+
+        def to_pixel(point: np.ndarray) -> tuple[int, int]:
+            normalized = (np.asarray(point, dtype=np.float64) - center) / span
+            return (
+                int(round(panel_index * panel_width + panel_width / 2 + normalized[0] * (panel_width - 2 * margin))),
+                int(round(height / 2 - normalized[1] * (height - 2 * margin))),
+            )
+
+        return to_pixel, span
+
+    top_pixel, top_span = transform(top, 0)
+    side_pixel, side_span = transform(side, 1)
+    colors = {
+        "target_agent": (0, 150, 245),
+        "target_patient": (40, 80, 220),
+        "sim_agent": (65, 180, 65),
+        "sim_patient": (220, 120, 40),
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (width, height))
+    for item in segments:
+        agent_id = str(item["agent_object_id"])
+        patient_id = str(item["patient_object_id"])
+        target = item["target_trajectories"]
+        simulated = item["physics_rollout"]["simulated_trajectories"]
+        frames = item["physics_rollout"]["frame_indices"]
+        world_arrays = {
+            "target_agent": np.asarray([record["position_blender_world_m"] for record in target[agent_id]]),
+            "target_patient": np.asarray([record["position_blender_world_m"] for record in target[patient_id]]),
+            "sim_agent": np.asarray([record["position_blender_world_m"] for record in simulated[agent_id]]),
+            "sim_patient": np.asarray([record["position_blender_world_m"] for record in simulated[patient_id]]),
+        }
+        radii = item["physics_rollout"]["sphere_radius_m_by_object"]
+        for index, frame_index in enumerate(frames):
+            image = np.full((height, width, 3), 248, dtype=np.uint8)
+            cv2.line(image, (panel_width, 0), (panel_width, height), (180, 180, 180), 1)
+            cv2.putText(image, "top view", (16, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (25, 25, 25), 1, cv2.LINE_AA)
+            cv2.putText(image, "side view", (panel_width + 16, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (25, 25, 25), 1, cv2.LINE_AA)
+            for key, world in world_arrays.items():
+                projections = (
+                    np.stack([world @ axis_u, world @ axis_v], axis=1),
+                    np.stack([world @ axis_u, world @ up], axis=1),
+                )
+                object_id = agent_id if key.endswith("agent") else patient_id
+                thickness = -1 if key.startswith("sim") else 2
+                for panel_index, (values, pixel, span) in enumerate(
+                    ((projections[0], top_pixel, top_span), (projections[1], side_pixel, side_span))
+                ):
+                    history = np.asarray([pixel(value) for value in values[: index + 1]], dtype=np.int32)
+                    if len(history) >= 2:
+                        cv2.polylines(image, [history], False, colors[key], 2, cv2.LINE_AA)
+                    radius_px = max(
+                        4,
+                        int(round(float(radii[object_id]) / span * (panel_width - 2 * margin))),
+                    )
+                    cv2.circle(image, pixel(values[index]), radius_px, colors[key], thickness, cv2.LINE_AA)
+            cv2.putText(
+                image,
+                f"{item['segment']} frame {frame_index} | outline=target filled=3D analytic rollout",
+                (16, height - 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (30, 30, 30),
+                1,
+                cv2.LINE_AA,
+            )
+            writer.write(image)
+    writer.release()
 
 
 def _run_learning_rate_trial(payload: dict[str, Any]) -> dict[str, Any]:
@@ -828,6 +924,8 @@ def main() -> None:
             ],
         },
     )
+    if args.render_video:
+        _render_debug_video(result, output_dir / "debug" / "target_vs_rollout.mp4")
     print(
         json.dumps(
             {

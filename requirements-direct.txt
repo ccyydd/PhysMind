@@ -1,0 +1,11 @@
+# Lightweight dependencies for direct VLM answering and benchmark evaluation.
+google-generativeai==0.8.6
+httpx[socks]==0.28.1
+openai==2.41.0
+python-dotenv==1.2.2
+tqdm==4.67.3
+
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+pillow==12.2.0
+pycocotools==2.0.11

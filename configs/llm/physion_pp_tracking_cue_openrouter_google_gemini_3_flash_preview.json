@@ -1,0 +1,8 @@
+{
+  "provider": "openrouter",
+  "model": "google/gemini-3-flash-preview",
+  "input_mode": "uniform_sampled_frames_with_persistent_target_cues",
+  "dataset_root": "data/physion_pp_tracking_cue_baseline_v1",
+  "num_frames": 16,
+  "max_output_tokens": 4096
+}

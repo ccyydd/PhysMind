@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from agent.world_model.artifacts import artifact_path_by_name, question_root_from_output
+from agent.world_model.module_profiles import default_module_profile_policy
 from scripts.world_model.foundationpose_register import (
     add_foundationpose_to_path,
     register_keyframe_seeded_single_candidate,
@@ -26,18 +27,159 @@ CLEVRER_MESH_TARGET_FACES = 2000
 DEFAULT_AREA_ALIGNMENT_TOLERANCE = 0.01
 DEFAULT_DEPTH_ALIGNMENT_TOLERANCE = 0.005
 DEFAULT_AREA_ALIGNMENT_MAX_ITERATIONS = 4
+PHYSION_PP_ALIGNMENT_MIN_CAMERA_DEPTH = 1e-3
+PHYSION_PP_ALIGNMENT_AREA_COLLAPSE_RATIO = 0.6
+PHYSION_PP_ALIGNMENT_IOU_DROP = 0.5
 MESH_CONDITIONING_DECISION_ID = "GEO-004.mesh_conditioning"
 CLEVRER_MESH_CONDITIONING_ROUTE = (
     "mesh_conditioning.aabb_no_guard"
 )
+PHYSION_PP_WARN_ONLY_MESH_CONDITIONING_ROUTE = (
+    "mesh_conditioning.obb_warn"
+)
+PHYSION_PP_ROLLBACK_MESH_CONDITIONING_ROUTE = (
+    "mesh_conditioning.obb_rollback"
+)
+# Kept in sync with run_sam3_video_tracks.py / run_foundationpose.py / agent/world_model/tools.py.
+PHYSION_YELLOW_PATCH_TRACK_PREFIX = "physion_yellow_patch_"
 
 
+def _is_static_ground_fixture_track_id(track_id: Any) -> bool:
+    return str(track_id or "").startswith(PHYSION_YELLOW_PATCH_TRACK_PREFIX)
 
 
+def _physion_pp_scenario(object_plan_payload: dict[str, Any]) -> str:
+    special_scene = object_plan_payload.get("special_scene") or {}
+    scene_metadata = special_scene.get("scene_metadata") or {}
+    return str(
+        scene_metadata.get("scenario")
+        or special_scene.get("scenario")
+        or object_plan_payload.get("scenario")
+        or ""
+    ).strip().lower()
 
 
+def _mesh_conditioning_route_profile(
+    object_plan_payload: dict[str, Any],
+) -> dict[str, Any]:
+    special_scene = object_plan_payload.get("special_scene")
+    special_scene = special_scene if isinstance(special_scene, dict) else {}
+    route_record = special_scene.get("mesh_conditioning_route")
+    if not isinstance(route_record, dict):
+        raise ValueError("mesh-conditioning object plan is missing its route record")
+    if route_record.get("decision_id") != MESH_CONDITIONING_DECISION_ID:
+        raise ValueError(
+            "mesh-conditioning route record has an unexpected decision_id: "
+            f"{route_record.get('decision_id')!r}"
+        )
+    route = str(route_record.get("route") or "")
+    policy = default_module_profile_policy()
+    profile = policy.route_profiles.get(route)
+    if profile is None or profile.decision_id != MESH_CONDITIONING_DECISION_ID:
+        raise ValueError(f"unsupported mesh-conditioning route: {route!r}")
+    context = route_record.get("context")
+    if not isinstance(context, dict):
+        raise ValueError("mesh-conditioning route record is missing its context")
+    benchmark = str(context.get("benchmark") or "").strip().lower()
+    scenario = str(context.get("scenario") or "").strip().lower()
+    if benchmark != profile.benchmark:
+        raise ValueError(
+            "mesh-conditioning route benchmark context mismatch: "
+            f"{benchmark!r} != {profile.benchmark!r}"
+        )
+    allowed_scenarios = frozenset(profile.scenarios)
+    if allowed_scenarios and scenario not in allowed_scenarios:
+        raise ValueError(
+            "mesh-conditioning route scenario context mismatch: "
+            f"{scenario!r} not in {sorted(allowed_scenarios)!r}"
+        )
+    if not allowed_scenarios and scenario:
+        raise ValueError(
+            "CLEVRER mesh-conditioning route must not record a Physion++ scenario: "
+            f"{scenario!r}"
+        )
+    artifact_scenario = _physion_pp_scenario(object_plan_payload)
+    if benchmark == "physion_pp" and artifact_scenario != scenario:
+        raise ValueError(
+            "mesh-conditioning route scenario does not match object-plan metadata: "
+            f"{scenario!r} != {artifact_scenario!r}"
+        )
+    resolved_profile = policy.resolve_route(
+        MESH_CONDITIONING_DECISION_ID,
+        route,
+        benchmark=benchmark,
+        scenario=scenario,
+    )
+    module = resolved_profile.module("mesh_conditioning")
+    if module.implementation != "project_scale_align_conditioned_mesh":
+        raise ValueError(
+            "unsupported mesh-conditioning module implementation: "
+            f"{module.implementation!r}"
+        )
+    box_fit = module.require_string("box_fit")
+    if box_fit not in {"aabb", "obb"}:
+        raise ValueError(f"unsupported mesh-conditioning box fit: {box_fit!r}")
+    alignment_safety = module.require_string("alignment_safety")
+    if alignment_safety not in {"disabled", "warn_only", "rollback"}:
+        raise ValueError(
+            "unsupported mesh-conditioning alignment safety: "
+            f"{alignment_safety!r}"
+        )
+    return {
+        "route": route,
+        "benchmark": resolved_profile.benchmark,
+        "scenarios": allowed_scenarios,
+        "use_obb_box_fit": box_fit == "obb",
+        "alignment_safety_mode": alignment_safety,
+        "scenario": scenario,
+    }
 
 
+def _physion_pp_alignment_safety_trigger(
+    *,
+    projected_vertices: np.ndarray,
+    metrics: dict[str, Any],
+    previous_metrics: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    vertices = np.asarray(projected_vertices, dtype=np.float64)
+    reasons: list[str] = []
+    details: dict[str, Any] = {}
+
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or not np.isfinite(vertices).all():
+        reasons.append("invalid_projected_vertices")
+    else:
+        # Camera depth is the only near-plane signal. Projected image coordinates are
+        # intentionally not checked: a valid mesh may extend beyond the video frame.
+        min_camera_depth = float(vertices[:, 2].min())
+        details["min_camera_depth"] = min_camera_depth
+        if min_camera_depth <= PHYSION_PP_ALIGNMENT_MIN_CAMERA_DEPTH:
+            reasons.append("near_plane_crossing")
+
+    rendered_area = float(metrics.get("rendered_area", float("nan")))
+    current_iou = float(metrics.get("iou_with_sam3_mask", float("nan")))
+    details.update({"rendered_area": rendered_area, "iou_with_sam3_mask": current_iou})
+    if not np.isfinite(rendered_area) or rendered_area <= 0.0:
+        reasons.append("invalid_rendered_area")
+    if not np.isfinite(current_iou):
+        reasons.append("invalid_iou")
+
+    if previous_metrics is not None:
+        previous_area = float(previous_metrics.get("rendered_area", float("nan")))
+        previous_iou = float(previous_metrics.get("iou_with_sam3_mask", float("nan")))
+        if np.isfinite(previous_area) and previous_area > 0.0 and np.isfinite(rendered_area):
+            area_ratio = rendered_area / previous_area
+            details["area_ratio_from_previous"] = area_ratio
+            if area_ratio < PHYSION_PP_ALIGNMENT_AREA_COLLAPSE_RATIO:
+                reasons.append("rendered_area_collapse")
+        if np.isfinite(previous_iou) and np.isfinite(current_iou):
+            iou_drop = previous_iou - current_iou
+            details["iou_drop_from_previous"] = iou_drop
+            if iou_drop > PHYSION_PP_ALIGNMENT_IOU_DROP:
+                reasons.append("iou_drop")
+
+    if not reasons:
+        return None
+    return {"reasons": reasons, **details}
 
 
 def _projection_preserving_metric_scale(
@@ -325,6 +467,37 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _save_depth_colormap(path: Path, depth: np.ndarray, mask: np.ndarray | None, title: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    values = depth.astype(np.float64)
+    if mask is None:
+        valid = np.isfinite(values) & (values > 0)
+    else:
+        valid = mask.astype(bool) & np.isfinite(values) & (values > 0)
+    if not np.any(valid):
+        raise ValueError(f"No valid depth values for debug image: {path}")
+
+    display = np.full(values.shape, np.nan, dtype=np.float64)
+    display[valid] = values[valid]
+    vmin = float(np.nanpercentile(display, 2))
+    vmax = float(np.nanpercentile(display, 98))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+        vmin = float(np.nanmin(display))
+        vmax = float(np.nanmax(display))
+
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
+    image = ax.imshow(display, cmap="magma", vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    ax.axis("off")
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label("Depth")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
 
 
 def _overlay_mask_boundary(image_bgr: np.ndarray, mask: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
@@ -339,8 +512,117 @@ def _overlay_mask_boundary(image_bgr: np.ndarray, mask: np.ndarray, color: tuple
     return output
 
 
+def _save_projection_debug_images(
+    *,
+    video: Path,
+    frame_index: int,
+    object_id: str,
+    object_dir: Path,
+    sam3_mask: np.ndarray,
+    video_depth: np.ndarray,
+    projected_mesh,
+    intrinsic: np.ndarray,
+    occluder_mask: np.ndarray | None = None,
+) -> dict[str, str]:
+    import cv2
+
+    object_dir.mkdir(parents=True, exist_ok=True)
+    original = _read_frame_bgr(video, frame_index)
+    if video_depth.shape != sam3_mask.shape:
+        sam3_mask = _resize_mask_nearest(sam3_mask, video_depth.shape)
+
+    original_path = object_dir / "original.png"
+    video_depth_path = object_dir / "video_depth.png"
+    mesh_render_path = object_dir / "mesh_render.png"
+    mesh_render_depth_path = object_dir / "mesh_render_depth.png"
+
+    original_with_mask = _overlay_mask_boundary(original, sam3_mask, (0, 255, 255))
+    cv2.imwrite(str(original_path), original_with_mask)
+
+    _save_depth_colormap(
+        video_depth_path,
+        video_depth,
+        sam3_mask,
+        f"{object_id} video depth inside SAM3 mask",
+    )
+
+    vertices = np.asarray(projected_mesh.vertices, dtype=np.float64)
+    faces = np.asarray(projected_mesh.faces, dtype=np.int64)
+    rendered = render_mask_occluded_mesh(
+        vertices_camera=vertices,
+        faces=faces,
+        intrinsic=intrinsic,
+        image_shape=video_depth.shape,
+        occluder_mask=occluder_mask,
+        self_mask=sam3_mask,
+    )
+    rendered_mask = rendered["visible_mask"]
+    rendered_depth = rendered["rendered_depth"]
+    mesh_overlay = _overlay_mask_boundary(original, rendered_mask, (0, 0, 255))
+    mesh_overlay = _overlay_mask_boundary(mesh_overlay, sam3_mask, (0, 255, 255))
+    cv2.imwrite(str(mesh_render_path), mesh_overlay)
+
+    _save_depth_colormap(
+        mesh_render_depth_path,
+        rendered_depth,
+        rendered_mask,
+        f"{object_id} projected mesh rendered depth",
+    )
+
+    return {
+        "original": str(original_path),
+        "video_depth": str(video_depth_path),
+        "mesh_render": str(mesh_render_path),
+        "mesh_render_depth": str(mesh_render_depth_path),
+    }
 
 
+def _save_pre_scale_foundationpose_debug(
+    *,
+    object_dir: Path,
+    object_id: str,
+    rgb: np.ndarray,
+    depth: np.ndarray,
+    mask: np.ndarray,
+    seed_pose_4x4: np.ndarray,
+    refined_pose_4x4: np.ndarray,
+    diagnostics: dict[str, Any],
+) -> dict[str, str]:
+    import cv2
+
+    object_dir.mkdir(parents=True, exist_ok=True)
+    rgb_path = object_dir / "rgb.png"
+    mask_path = object_dir / "mask.png"
+    depth_path = object_dir / "depth.png"
+    poses_path = object_dir / "poses.json"
+
+    cv2.imwrite(str(rgb_path), cv2.cvtColor(np.asarray(rgb, dtype=np.uint8), cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(mask_path), (np.asarray(mask, dtype=np.uint8) * 255))
+    _save_depth_colormap(
+        depth_path,
+        np.asarray(depth, dtype=np.float32),
+        np.asarray(mask, dtype=bool),
+        f"{object_id} pre-scale FoundationPose depth inside mask",
+    )
+    poses_path.write_text(
+        json.dumps(
+            {
+                "object_id": object_id,
+                "seed_pose_4x4": np.asarray(seed_pose_4x4, dtype=np.float64).reshape(4, 4).tolist(),
+                "refined_pose_4x4": np.asarray(refined_pose_4x4, dtype=np.float64).reshape(4, 4).tolist(),
+                "diagnostics": diagnostics,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    return {
+        "rgb": str(rgb_path),
+        "mask": str(mask_path),
+        "depth": str(depth_path),
+        "poses": str(poses_path),
+    }
 
 
 def _visual_summary(mesh) -> dict[str, Any]:
@@ -660,6 +942,11 @@ def _project_conditioned_mesh(
     physion_pp_scenario: str = "",
     physion_pp_alignment_safety_mode: str = "disabled",
 ):
+    if physion_pp_alignment_safety_mode not in {"disabled", "warn_only", "rollback"}:
+        raise ValueError(
+            "Invalid Physion++ alignment safety mode: "
+            f"{physion_pp_alignment_safety_mode}"
+        )
     monitor_alignment_safety = physion_pp_alignment_safety_mode in {"warn_only", "rollback"}
     enable_alignment_rollback = physion_pp_alignment_safety_mode == "rollback"
     object_id = str(mesh_record.get("object_id") or "unknown")
@@ -749,6 +1036,11 @@ def _project_conditioned_mesh(
     }
     best_state: dict[str, Any] | None = None
     if monitor_alignment_safety:
+        initial_trigger = _physion_pp_alignment_safety_trigger(
+            projected_vertices=projected_vertices,
+            metrics=initial_metrics,
+            previous_metrics=None,
+        )
         if initial_trigger is not None:
             safety_fallback.update(
                 {
@@ -842,6 +1134,11 @@ def _project_conditioned_mesh(
         }
         safety_trigger = None
         if monitor_alignment_safety:
+            safety_trigger = _physion_pp_alignment_safety_trigger(
+                projected_vertices=final_projected_vertices,
+                metrics=final_metrics,
+                previous_metrics=previous_metrics,
+            )
             trace_entry["physion_pp_safety_trigger"] = safety_trigger
         alignment_trace.append(trace_entry)
         if safety_trigger is not None:
@@ -1090,6 +1387,41 @@ def _pre_scale_foundationpose_refinement(
     set_seed(0)
     mesh.vertices = np.ascontiguousarray(np.asarray(mesh.vertices, dtype=np.float32))
     mesh.vertex_normals = np.ascontiguousarray(np.asarray(mesh.vertex_normals, dtype=np.float32))
+    try:
+        estimator = FoundationPose(
+            model_pts=mesh.vertices,
+            model_normals=mesh.vertex_normals,
+            mesh=mesh,
+            scorer=scorer,
+            refiner=refiner,
+            debug_dir=str(foundationpose_debug_dir),
+            debug=0,
+            glctx=glctx,
+        )
+        if estimator.mesh is not None:
+            estimator.mesh.vertices = np.ascontiguousarray(np.asarray(estimator.mesh.vertices, dtype=np.float32))
+            estimator.mesh.vertex_normals = np.ascontiguousarray(
+                np.asarray(estimator.mesh.vertex_normals, dtype=np.float32)
+            )
+        estimator.diameter = float(estimator.diameter)
+        pose, diagnostics = register_keyframe_seeded_single_candidate(
+            segment_estimator=estimator,
+            K=np.ascontiguousarray(intrinsic, dtype=np.float32),
+            rgb=np.ascontiguousarray(rgb),
+            depth=np.ascontiguousarray(depth, dtype=np.float32),
+            ob_mask=np.asarray(mask, dtype=bool),
+            seed_raw_pose=np.asarray(seed_pose_4x4, dtype=np.float32).reshape(4, 4),
+            iteration=int(est_refine_iter),
+            seed_rotation_source="sam3d_objects.rotation",
+        )
+        diagnostics = {
+            **diagnostics,
+            "foundationpose_debug_dir": str(foundationpose_debug_dir) if debug_dir is not None else None,
+        }
+        return pose, diagnostics
+    finally:
+        if temporary_debug_dir is not None:
+            temporary_debug_dir.cleanup()
 
 
 def _guess_translation_from_mask_depth(
@@ -1144,6 +1476,9 @@ def run_mesh_conditioning(*, object_plan: Path, output: Path, target_faces: int,
     debug_artifacts = os.getenv("PHYSMIND_DEBUG_ARTIFACTS") == "1"
     conditioned_dir.mkdir(parents=True, exist_ok=True)
     projected_dir.mkdir(parents=True, exist_ok=True)
+    if debug_artifacts:
+        debug_root.mkdir(parents=True, exist_ok=True)
+        pre_scale_debug_root.mkdir(parents=True, exist_ok=True)
 
     pre_scale_foundationpose_context: dict[str, Any] | None = None
 
@@ -1260,12 +1595,50 @@ def run_mesh_conditioning(*, object_plan: Path, output: Path, target_faces: int,
                 "mask_preprocess_geometry": preprocess_geometry,
             }
             pre_scale_debug_images = {}
+            if debug_artifacts and pre_scale_debug_dir is not None:
+                pre_scale_debug_images = _save_pre_scale_foundationpose_debug(
+                    object_dir=pre_scale_debug_dir,
+                    object_id=str(object_id),
+                    rgb=rgb,
+                    depth=depth,
+                    mask=processed_mask,
+                    seed_pose_4x4=pre_scale_seed_pose,
+                    refined_pose_4x4=pre_scale_pose,
+                    diagnostics=pre_scale_diagnostics,
+                )
+            adjusted_conditioned_mesh, projected_mesh, foundationpose_mesh, projection_info = _project_conditioned_mesh(
+                mesh=conditioned_mesh,
+                mesh_record=mesh_record,
+                fit=fit,
+                video_depth=depth,
+                sam3_mask=mask,
+                intrinsic=intrinsic,
+                sam3d_glb_yup_rotation_undone=source_mesh_frame_conversion != "none",
+                occluder_mask=occluder_union,
+                pre_scale_foundationpose_pose_4x4=pre_scale_pose,
+                pre_scale_foundationpose_diagnostics=pre_scale_diagnostics,
+                skip_metric_alignment=_is_static_ground_fixture_track_id(geometry.get("source_track_id")),
+                physion_pp_scenario=physion_pp_scenario,
+                physion_pp_alignment_safety_mode=physion_pp_alignment_safety_mode,
+            )
             projected_path = projected_dir / f"{object_id}_projected.glb"
             foundationpose_mesh_path = projected_dir / f"{object_id}_foundationpose_local.glb"
             adjusted_conditioned_mesh.export(conditioned_path)
             projected_mesh.export(projected_path)
             foundationpose_mesh.export(foundationpose_mesh_path)
             debug_images = {}
+            if debug_artifacts and video is not None:
+                debug_images = _save_projection_debug_images(
+                    video=video,
+                    frame_index=frame_index,
+                    object_id=str(object_id),
+                    object_dir=debug_root / str(object_id),
+                    sam3_mask=mask,
+                    video_depth=depth,
+                    projected_mesh=projected_mesh,
+                    intrinsic=intrinsic,
+                    occluder_mask=occluder_union,
+                )
             objects.append(
                 {
                     "object_id": object_id,

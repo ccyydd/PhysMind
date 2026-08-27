@@ -1503,6 +1503,11 @@ class QueryConditionedPhysicalRolloutAdapter:
                     )
             payload["world_model_artifact_dir"] = str(source_dir)
             self.artifacts.write(artifact_path, payload)
+            self._maybe_render_plane_projection_debug(
+                artifact_path=artifact_path,
+                payload=payload,
+                world_model_dir=source_dir,
+            )
             _log_tool(self.tool_name, f"artifact={artifact_path} {_trajectory_summary(payload)}")
             return ToolResult(self.tool_name, "ok", str(artifact_path), payload=payload)
 
@@ -1783,6 +1788,34 @@ class QueryConditionedPhysicalRolloutAdapter:
             ],
         }
 
+    def _maybe_render_plane_projection_debug(
+        self,
+        *,
+        artifact_path: Path,
+        payload: Dict[str, Any],
+        world_model_dir: Path,
+    ) -> None:
+        if not self.artifacts.debug_artifacts:
+            return
+        fit_path = world_model_dir / "simulatable-world-reconstruction" / "fit" / "world_reconstruction_fit.json"
+        if not fit_path.exists():
+            return
+        try:
+            result = render_qcpr_plane_projection_debug(
+                trajectory_path=artifact_path,
+                world_reconstruction_fit_path=fit_path,
+            )
+        except Exception as exc:
+            result = {
+                "status": "tool_error",
+                "error_message": str(exc),
+                "trajectory_path": str(artifact_path),
+                "world_reconstruction_fit_path": str(fit_path),
+            }
+        debug_artifacts = dict(payload.get("debug_artifacts") or {})
+        debug_artifacts["plane_projection_debug"] = result
+        payload["debug_artifacts"] = debug_artifacts
+        self.artifacts.write(artifact_path, payload)
 
     def _read_optional(self, path: Path) -> Dict[str, Any]:
         return self.artifacts.read_optional(path) or {}

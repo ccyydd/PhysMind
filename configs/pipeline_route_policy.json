@@ -1,0 +1,1654 @@
+{
+  "schema_version": 2,
+  "policy_id": "physmind_unified_v1",
+  "benchmarks": {
+    "clevrer": [],
+    "physion_pp": [
+      "friction_platform_pp",
+      "bouncy_wall_pp",
+      "bouncy_platform_pp",
+      "friction_collision_pp",
+      "mass_collision_pp"
+    ]
+  },
+  "decisions": {
+    "INP-001.world_model_video_source": {
+      "stage": "input",
+      "level": "benchmark",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "video.original"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "video.cue_trimmed"
+        }
+      ]
+    },
+    "INP-002.answer_fallback_video_source": {
+      "stage": "input",
+      "level": "failure",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "runtime_fallback",
+          "use": "video.original"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ]
+          },
+          "selection": "runtime_fallback",
+          "use": "video.cue_annotated"
+        }
+      ]
+    },
+    "INP-003.temporal_partition": {
+      "stage": "input",
+      "level": "scenario",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "temporal.single_video"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "temporal.single_video"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "temporal.cue_two_segment"
+        }
+      ]
+    },
+    "SCN-001.scene_assessment_bundle": {
+      "stage": "scene_assessment",
+      "level": "scene",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer",
+              "physion_pp"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "assessment.motion_camera_support_vlm"
+        }
+      ]
+    },
+    "SCN-002.object_inventory_source": {
+      "stage": "object_plan",
+      "level": "scene",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer",
+              "physion_pp"
+            ]
+          },
+          "selection": "shared_default",
+          "use": "inventory.from_tracks"
+        }
+      ]
+    },
+    "TRK-001.tracking_family": {
+      "stage": "tracking",
+      "level": "scenario",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "tracking.sam3_broad_text"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "tracking.gdino_role_box_point"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "tracking.gdino_two_segment_point_probe"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "tracking.gdino_per_part_seeds"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "tracking.sam3_two_segment_text"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "tracking.gdino_two_segment_boxes"
+        }
+      ]
+    },
+    "TRK-002.cue_role_binding": {
+      "stage": "tracking",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_wall_pp",
+              "bouncy_platform_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "role_binding.cue_rounds"
+        }
+      ]
+    },
+    "TRK-003.static_role_assignment": {
+      "stage": "tracking",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "static_roles.platform_displacement"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "static_roles.wall_patient_two_segment"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "static_roles.bounce_platform_displacement"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "static_roles.collision_structure"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "static_roles.mass_structure"
+        }
+      ]
+    },
+    "TRK-004.cross_segment_identity": {
+      "stage": "tracking",
+      "level": "segment",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "identity.vlm_ab"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "identity.vlm_ab"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "identity.vlm_ab"
+        }
+      ]
+    },
+    "TRK-005.mass_extra_patient_link": {
+      "stage": "object_plan",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "role_link.vlm_identity"
+        }
+      ]
+    },
+    "LBL-001.track_vlm_labeling": {
+      "stage": "labeling",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "label.vlm_geometry_basic"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "label.vlm_geometry_concave"
+        }
+      ]
+    },
+    "LBL-002.false_positive_advice_effect": {
+      "stage": "labeling",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer",
+              "physion_pp"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "label.false_positive_advice_only"
+        }
+      ]
+    },
+    "DEP-001.intrinsics_backend": {
+      "stage": "intrinsics",
+      "level": "scene",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer",
+              "physion_pp"
+            ]
+          },
+          "selection": "shared_default",
+          "use": "intrinsics.moge2_fixed_camera"
+        }
+      ]
+    },
+    "DEP-002.depth_partition": {
+      "stage": "metric_depth",
+      "level": "scenario",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "depth.vda_full_video"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "depth.vda_full_video"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "depth.vda_two_segment_affine"
+        }
+      ]
+    },
+    "DEP-003.segment_depth_alignment": {
+      "stage": "metric_depth",
+      "level": "segment",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "depth.affine_background_curtain"
+        }
+      ]
+    },
+    "GEO-001.sam3d_observation_selection": {
+      "stage": "geometry",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "geometry.static_temporal_composite"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "geometry.selected_observation"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp",
+              "bouncy_platform_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "geometry.selected_observation"
+        }
+      ]
+    },
+    "GEO-002.cross_segment_mesh_reuse": {
+      "stage": "geometry",
+      "level": "segment",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "mesh_reuse.same_role_identity"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "mesh_reuse.same_role_identity"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "mesh_reuse.ball_agent_patient_conditional"
+        }
+      ]
+    },
+    "GEO-003.foundationpose_agent_geometry": {
+      "stage": "geometry",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ],
+            "roles": [
+              "agent"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "agent_geometry.sphere_no_foundationpose"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ],
+            "roles": [
+              "agent"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "agent_geometry.sphere_no_foundationpose"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_platform_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ],
+            "roles": [
+              "agent"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "agent_geometry.native_foundationpose"
+        }
+      ]
+    },
+    "GEO-004.mesh_conditioning": {
+      "stage": "mesh_conditioning",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "mesh_conditioning.aabb_no_guard"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_platform_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "mesh_conditioning.obb_warn"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "mesh_conditioning.obb_rollback"
+        }
+      ]
+    },
+    "POS-001.pose_input_and_foundationpose": {
+      "stage": "pose",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer",
+              "physion_pp"
+            ]
+          },
+          "selection": "shared_default",
+          "use": "pose.mask_select_validate_track"
+        }
+      ]
+    },
+    "POS-002.ground_motion_gate": {
+      "stage": "pose_correction",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "ground.vlm_horizontal_motion"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_wall_pp",
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "ground.agent_airborne_fixture_ground"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "ground.vlm_horizontal_motion"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "ground.collision_forced_true"
+        }
+      ]
+    },
+    "POS-003.gravity_estimator": {
+      "stage": "pose_correction",
+      "level": "scenario",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "gravity.overlap_aabb_post_snap"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_wall_pp",
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "gravity.overlap_obb_pre_snap"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "gravity.geocalib_8frame_z_negative"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "gravity.geocalib_8frame"
+        }
+      ]
+    },
+    "POS-004.gravity_roll_and_z_constraints": {
+      "stage": "pose_correction",
+      "level": "scenario",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "gravity_constraints.overlap_roll"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_wall_pp",
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "gravity_constraints.overlap_roll"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "gravity_constraints.roll_zero_z_negative"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "gravity_constraints.roll_zero"
+        }
+      ]
+    },
+    "POS-005.rotation_policy": {
+      "stage": "pose_correction",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer",
+              "physion_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "rotation.geometry_conditioned"
+        }
+      ]
+    },
+    "POS-006.support_snap": {
+      "stage": "pose_correction",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "support.ray_slide_ground"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "support.platform_sphere_agent"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "support.wall_sphere_agent"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "support.agent_exempt"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "support.moving_patient_exempt"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "support.patient_exempt"
+        }
+      ]
+    },
+    "POS-007.static_fixture_flush": {
+      "stage": "pose_correction",
+      "level": "object",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_wall_pp",
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "flush.static_fixture"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "flush.segment1_patient"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "flush.linked_extra"
+        }
+      ]
+    },
+    "POS-008.line_layout": {
+      "stage": "pose_correction",
+      "level": "scene",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "layout.line_static_orientation"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "layout.line_static_orientation"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "layout.not_applicable"
+        }
+      ]
+    },
+    "POS-009.friction_platform_agent_trajectory": {
+      "stage": "pose_correction",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ],
+            "roles": [
+              "agent"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "trajectory.platform_sphere"
+        }
+      ]
+    },
+    "POS-010.bouncy_platform_agent_trajectory": {
+      "stage": "pose_correction",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_platform_pp"
+            ],
+            "roles": [
+              "agent"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "trajectory.bounce_mask"
+        }
+      ]
+    },
+    "POS-011.bouncy_wall_agent_trajectory": {
+      "stage": "pose_correction",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ],
+            "roles": [
+              "agent"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "trajectory.wall_mixed_geometry"
+        }
+      ]
+    },
+    "POS-012.collision_patient_motion_gate": {
+      "stage": "pose_correction",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ],
+            "roles": [
+              "patient"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "motion.mask_centroid_5px"
+        }
+      ]
+    },
+    "POS-013.collision_patient_drop": {
+      "stage": "pose_correction",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ],
+            "roles": [
+              "patient"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "trajectory.patient_vertical_drop"
+        }
+      ]
+    },
+    "POS-014.mass_extra_flush_and_mesh_adopt": {
+      "stage": "pose_correction",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ],
+            "roles": [
+              "extra",
+              "patient"
+            ]
+          },
+          "selection": "deterministic_measurement",
+          "use": "mesh_adopt.linked_extra_to_patient"
+        }
+      ]
+    },
+    "POS-015.mass_agent_flush": {
+      "stage": "pose_correction",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ],
+            "roles": [
+              "agent"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "flush.mass_agent"
+        }
+      ]
+    },
+    "POS-016.mass_ball_precontact_trajectory": {
+      "stage": "pose_correction",
+      "level": "role",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ],
+            "roles": [
+              "ball"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "trajectory.ball_precontact_mask_line"
+        }
+      ]
+    },
+    "SWR-001.fit_backend": {
+      "stage": "swr",
+      "level": "scenario",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_backend.impulse_analytic"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_backend.surface_friction_sphere"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_backend.wall_bounce_sphere"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_backend.platform_bounce_sphere"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_backend.collision_friction_spheres"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_backend.collision_mass_spheres"
+        }
+      ]
+    },
+    "SWR-002.fit_strategy": {
+      "stage": "swr",
+      "level": "scenario",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_fit.bounded_plane_dynamic_sphere"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_fit.two_segment_shared_speed"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_fit.bounded_planes_full_trajectory"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_fit.two_segment_shared_speed_radii"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "swr_fit.ball_agent_impulse_mass"
+        }
+      ]
+    },
+    "SWR-003.fit_geometry_source": {
+      "stage": "swr",
+      "level": "scenario",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_wall_pp",
+              "bouncy_platform_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "shared_default",
+          "use": "geometry.corrected_mesh"
+        }
+      ]
+    },
+    "SWR-004.visual_pose_preservation": {
+      "stage": "swr",
+      "level": "scenario",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "visual_pose.position_only"
+        }
+      ]
+    },
+    "ROL-001.question_rollout_backend": {
+      "stage": "rollout",
+      "level": "question",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "rollout.tool_physics"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "rollout.surface_friction_analytic"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_wall_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "rollout.wall_bounce_analytic"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "bouncy_platform_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "rollout.platform_bounce_analytic"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "rollout.collision_friction_analytic"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "rollout.collision_mass_analytic"
+        }
+      ]
+    },
+    "ROL-002.clevrer_tool_planning": {
+      "stage": "rollout",
+      "level": "question",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "vlm_decision",
+          "use": "planning.two_round_tools"
+        }
+      ]
+    },
+    "ROL-003.clevrer_tool_plan_repair": {
+      "stage": "rollout",
+      "level": "failure",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "runtime_fallback",
+          "use": "planning.json_repair_fallback"
+        }
+      ]
+    },
+    "ANS-001.success_answer_backend": {
+      "stage": "final_answer",
+      "level": "question",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "answer.vlm_tools"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_wall_pp",
+              "bouncy_platform_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "answer.contact_artifact"
+        }
+      ]
+    },
+    "FAIL-001.world_model_answer_fallback": {
+      "stage": "final_answer",
+      "level": "failure",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer",
+              "physion_pp"
+            ]
+          },
+          "selection": "runtime_fallback",
+          "use": "answer.direct_fallback"
+        }
+      ]
+    },
+    "DA-001.input_modality": {
+      "stage": "direct_answer",
+      "level": "entrypoint",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer",
+              "physion_pp"
+            ],
+            "entrypoints": [
+              "direct-answer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "direct_input.video_or_frames"
+        }
+      ]
+    },
+    "DA-002.physionpp_cue_input": {
+      "stage": "direct_answer",
+      "level": "benchmark",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "direct_input.cue_annotated"
+        }
+      ]
+    },
+    "DA-003.prompt_family": {
+      "stage": "direct_answer",
+      "level": "question",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "prompt.descriptive_or_multiple_choice"
+        },
+        {
+          "when": {
+            "benchmarks": [
+              "physion_pp"
+            ],
+            "scenarios": [
+              "friction_platform_pp",
+              "bouncy_wall_pp",
+              "bouncy_platform_pp",
+              "friction_collision_pp",
+              "mass_collision_pp"
+            ]
+          },
+          "selection": "explicit_prior",
+          "use": "prompt.contact_yes_no"
+        }
+      ]
+    },
+    "DA-004.output_contract": {
+      "stage": "direct_answer",
+      "level": "run",
+      "routes": [
+        {
+          "when": {
+            "benchmarks": [
+              "clevrer",
+              "physion_pp"
+            ]
+          },
+          "selection": "shared_default",
+          "use": "output.standard_run_bundle"
+        }
+      ]
+    }
+  },
+  "optional_profiles": {
+    "option.native_agent.ray_trajectory": {
+      "level": "scenario",
+      "when": {
+        "benchmarks": [
+          "physion_pp"
+        ],
+        "scenarios": [
+          "friction_platform_pp"
+        ],
+        "roles": [
+          "agent"
+        ]
+      },
+      "default_enabled": false,
+      "overrides": {
+        "GEO-003.foundationpose_agent_geometry": "agent_geometry.native_foundationpose",
+        "POS-009.friction_platform_agent_trajectory": "trajectory.native_ray"
+      }
+    },
+    "option.native_agent.wall_trajectory": {
+      "level": "scenario",
+      "when": {
+        "benchmarks": [
+          "physion_pp"
+        ],
+        "scenarios": [
+          "bouncy_wall_pp"
+        ],
+        "roles": [
+          "agent"
+        ]
+      },
+      "default_enabled": false,
+      "overrides": {
+        "GEO-003.foundationpose_agent_geometry": "agent_geometry.native_foundationpose",
+        "POS-011.bouncy_wall_agent_trajectory": "trajectory.wall_native"
+      }
+    },
+    "option.visual_pose.corrected_rotation": {
+      "level": "scenario",
+      "when": {
+        "benchmarks": [
+          "physion_pp"
+        ],
+        "scenarios": [
+          "friction_collision_pp",
+          "mass_collision_pp"
+        ]
+      },
+      "default_enabled": false,
+      "overrides": {
+        "SWR-004.visual_pose_preservation": "visual_pose.corrected_rotation"
+      }
+    }
+  }
+}

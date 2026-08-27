@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from agent.query import create_openai_compatible_client
+from agent.world_model.route_policy import RoutePolicyValidationError
 from agent.world_model.tool_calling import (
     ToolCall,
     ToolCallRequest,
@@ -42,6 +43,51 @@ CLEVRER_TOOL_PLAN_REPAIR_ROUTE = (
 )
 
 
+def _require_clevrer_tool_plan_repair_route(
+    route_record: dict[str, Any] | None,
+    *,
+    request_context: dict[str, Any],
+) -> dict[str, Any] | None:
+    if request_context.get("benchmark") != "clevrer":
+        if route_record is not None:
+            raise RoutePolicyValidationError(
+                "CLEVRER tool-plan repair route is not applicable to this benchmark"
+            )
+        return None
+    if route_record is None:
+        raise RoutePolicyValidationError(
+            "missing ROL-003 CLEVRER tool-plan repair route record"
+        )
+    if route_record.get("decision_id") != CLEVRER_TOOL_PLAN_REPAIR_DECISION_ID:
+        raise RoutePolicyValidationError(
+            "CLEVRER tool-plan repair route has an unexpected decision_id: "
+            f"{route_record.get('decision_id')!r}"
+        )
+    route = str(route_record.get("route") or "")
+    if route != CLEVRER_TOOL_PLAN_REPAIR_ROUTE:
+        raise RoutePolicyValidationError(
+            f"unsupported CLEVRER tool-plan repair route: {route!r}"
+        )
+    record_context = route_record.get("context")
+    if not isinstance(record_context, dict):
+        raise RoutePolicyValidationError(
+            "CLEVRER tool-plan repair route is missing context"
+        )
+    expected_context = {
+        "benchmark": "clevrer",
+        "scenario": None,
+        "question_type": request_context.get("question_type"),
+    }
+    observed_context = {
+        key: record_context.get(key)
+        for key in expected_context
+    }
+    if observed_context != expected_context:
+        raise RoutePolicyValidationError(
+            "CLEVRER tool-plan repair route context mismatch: "
+            f"{observed_context!r} != {expected_context!r}"
+        )
+    return route_record
 
 
 class ToolCallPlanner:

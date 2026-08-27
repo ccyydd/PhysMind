@@ -1,0 +1,8 @@
+{
+  "provider": "openrouter",
+  "model": "z-ai/glm-4.6v",
+  "input_mode": "sampled_frames",
+  "num_frames": 8,
+  "max_output_tokens": 8192,
+  "answer_format": "plain-answer"
+}

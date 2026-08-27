@@ -16,6 +16,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agent.world_model.artifacts import artifact_path_by_name, question_root_from_output
+from agent.world_model.debug_artifacts import write_foundationpose_debug_pose_video
+from agent.world_model.physion_pp_agent_geometry import (
+    foundationpose_agent_geometry_route,
+    object_plan_scenario,
+    route_agent_geometry_policy_payload,
+    sphere_agent_object_ids,
+)
 from scripts.world_model.foundationpose_register import register_keyframe_seeded_single_candidate
 from scripts.world_model.mesh_projection import mask_occluded_mesh_mask, render_mesh_depth
 from scripts.world_model.video_depth_geometry import (
@@ -26,11 +33,24 @@ from scripts.world_model.video_depth_geometry import (
 
 FOUNDATIONPOSE_ROOT = PROJECT_ROOT / "third_party" / "FoundationPose"
 
+# Kept in sync with run_sam3_video_tracks.py / agent/world_model/tools.py; importing either
+# module here would pull SAM3/VLM dependencies into the FoundationPose worker.
+PHYSION_YELLOW_PATCH_TRACK_PREFIX = "physion_yellow_patch_"
+PHYSION_PP_STATIC_TRACK_PREFIX = "physion_pp_static_"
 STATIC_FIXTURE_ANCHOR_CANDIDATE_COUNT = 5
 STATIC_FIXTURE_MAX_EVAL_FRAMES = 16
 STATIC_FIXTURE_LOW_CONFIDENCE_MEAN_IOU = 0.5
 
 
+def _is_static_ground_fixture_track_id(track_id: Any) -> bool:
+    # The Physion++ yellow patient mat never moves; per-frame track_one on a thin low-texture
+    # sheet drifts along the view ray, so it gets a constant pose selected by cross-frame
+    # verification instead. Physion++ static fixtures (physion_pp_static_) take the same
+    # constant-pose path: in Physion++ OCP clips only the red-cue agent moves.
+    track_id = str(track_id or "")
+    return track_id.startswith(PHYSION_YELLOW_PATCH_TRACK_PREFIX) or track_id.startswith(
+        PHYSION_PP_STATIC_TRACK_PREFIX
+    )
 
 
 def _track_mask_keys_by_frame(mask_archive: Any, track_id: str) -> dict[int, str]:
@@ -110,6 +130,8 @@ def _float32_contiguous(array: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(array, dtype=np.float32)
 
 
+def _debug_artifacts_enabled(debug_artifacts: int) -> bool:
+    return debug_artifacts > 0 or os.getenv("PHYSMIND_DEBUG_ARTIFACTS") == "1"
 
 
 def _seed_pose_from_mesh_record(mesh_record: dict[str, Any], *, object_id: str) -> np.ndarray:
@@ -289,6 +311,7 @@ def run_foundationpose(
         raise ValueError(f"Video-depth sidecar intrinsics must have shape (3,3) or (N,3,3), got {intrinsics.shape}")
 
     debug_artifacts_flag = debug if debug_artifacts is None else debug_artifacts
+    debug_enabled = _debug_artifacts_enabled(debug_artifacts_flag)
     debug_dir = output.parent / "debug"
     glctx = context["glctx"]
     scorer = context["scorer"]
@@ -329,6 +352,7 @@ def run_foundationpose(
             object_id = str(target.get("object_id"))
             geometry_type = geometry_by_object.get(object_id, "irregular")
             source_track_id = str(target.get("source_track_id") or "")
+            is_static_fixture = _is_static_ground_fixture_track_id(source_track_id)
             if object_id in sphere_agent_ids:
                 object_results.append(
                     {
@@ -859,6 +883,17 @@ def run_foundationpose(
             if is_static_fixture:
                 object_payload["motion_model"] = "static_ground_fixture"
                 object_payload["static_fixture_selection"] = static_fixture_selection
+            if debug_enabled:
+                debug_video = write_foundationpose_debug_pose_video(
+                    debug_root=debug_dir,
+                    object_id=object_id,
+                    mesh=mesh,
+                    poses=poses,
+                    processed_images=processed_images,
+                    intrinsics=intrinsics,
+                )
+                if debug_video:
+                    object_payload.update(debug_video)
             object_results.append(object_payload)
 
     payload = {

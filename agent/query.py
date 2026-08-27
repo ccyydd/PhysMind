@@ -20,6 +20,18 @@ from utils.video import (
 
 
 ANSWER_TAG_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
+PHYSION_PP_FRAME_INPUT_INSTRUCTION = (
+    "The first {num_uniform_frames} images are uniformly sampled frames from the video "
+    "and are shown in chronological order. Use these frames to infer physical properties "
+    "and reason about the scene over time.\n\n"
+    "The final image is an additional target-identification cue frame. It is appended only "
+    "to show which objects the question refers to; it is not later in time than the first "
+    "{num_uniform_frames} images and must not be treated as the next physical state. In this "
+    "cue frame, red marks the AGENT object and yellow marks the PATIENT object.\n\n"
+    "The cue frame is frozen only to make the target objects easy to identify. The freezing "
+    "and colored overlays do not advance time or change the objects' positions, velocities, "
+    "or physical properties."
+)
 
 
 @dataclass

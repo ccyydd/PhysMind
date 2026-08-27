@@ -1,0 +1,7 @@
+{
+  "provider": "openrouter",
+  "model": "qwen/qwen3-vl-235b-a22b-instruct",
+  "input_mode": "sampled_frames_with_target_cue_reference",
+  "num_frames": 16,
+  "max_output_tokens": 4096
+}
